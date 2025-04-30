@@ -135,6 +135,21 @@ def stt_assemblyai_main(args, api_token):
     try:
         log_info(args, "Processing audio input...")
 
+        # ------------------------------------------------------------------
+        # Validate/auto-fix CLI options:
+        # AssemblyAI requires speaker diarisation when speakers_expected
+        # is provided.  Warn the user and enable diarisation automatically
+        # so that the request does not fail with HTTP 400.
+        # ------------------------------------------------------------------
+        if args.expected_speakers != -1 and not args.diarisation:
+            log_warning(
+                args,
+                "-e/--expected-speakers specified without -d/--diarisation; "
+                "enabling diarisation to satisfy AssemblyAI requirements."
+            )
+            args.diarisation = True
+            speaker_labels = True
+
         # Determine the output file
         if args.output == '-':
             potential_output = audio_input + '.txt'
@@ -172,7 +187,13 @@ def make_arg_parser():
     parser.add_argument('-d', '--diarisation', action='store_true', help='Enable speaker diarisation. This will label each speaker in the transcription.')
     parser.add_argument('-o', '--output', type=str, default=None, help='The path to the output file to store the result. If not provided, the result will be saved to a file with the same name as the input file but with a .txt extension. If "-" is provided, the result will be printed only to standard output and no files saved.')
     parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all status messages to standard output. If an output file is specified, the result will still be saved to that file (or standard output if `-` is specified).')
-    parser.add_argument('-e', '--expected-speakers', type=int, default=-1, help='The expected number of speakers for diarisation. This helps improve the accuracy of speaker labelling.')
+    parser.add_argument(
+        '-e', '--expected-speakers',
+        type=int, default=-1,
+        help=('The expected number of speakers for diarisation. '
+              'Requires --diarisation; if omitted, diarisation will be '
+              'enabled automatically.')
+    )
     parser.add_argument('-l', '--language', type=str, default='auto', help='The dominant language in the audio file. Example codes: en, en_au, en_uk, en_us, es, fr, de, it, pt, nl, hi, ja, zh, fi, ko, pl, ru. Default is "auto" for automatic language detection.')
     parser.add_argument('-R', '--region', choices=['eu','us'], default='eu', help='Select region for API endpoints: "eu" or "us". Defaults to EU')
     parser.add_argument('-v', '--verbose', action='count', default=0,
