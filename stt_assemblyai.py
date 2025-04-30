@@ -11,7 +11,7 @@ import subprocess
 def upload_file(api_token, audio_input):
     if audio_input.startswith('http://') or audio_input.startswith('https://'):
         return audio_input
-    url = 'https://api.assemblyai.com/v2/upload'
+    url = 'https://api.eu.assemblyai.com/v2/upload'
     headers = {
         'authorization': api_token,
         'content-type': 'application/octet-stream'
@@ -31,7 +31,7 @@ def upload_file(api_token, audio_input):
         raise
 
 def create_transcript(api_token, audio_url, speaker_labels):
-    url = "https://api.assemblyai.com/v2/transcript"
+    url = "https://api.eu.assemblyai.com/v2/transcript"
     headers = {
         "authorization": api_token,
         "content-type": "application/json"
@@ -52,7 +52,7 @@ def create_transcript(api_token, audio_url, speaker_labels):
         if args.verbose:
             print(f"Transcript ID: {transcript_id}")
         
-        polling_endpoint = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+        polling_endpoint = f"https://api.eu.assemblyai.com/v2/transcript/{transcript_id}"
         while True:
             response = requests.get(polling_endpoint, headers=headers)
             response.raise_for_status()
