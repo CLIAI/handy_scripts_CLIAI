@@ -6,6 +6,33 @@ import argparse
 import sys
 import json
 
+# ----------------------------------------------------------------------
+# Simple verbosity-aware logger.
+#   -v          → INFO messages
+#   -vvvvv      → DEBUG messages
+# All logs are written to STDERR and are suppressed by --quiet
+# ----------------------------------------------------------------------
+def _should_log(args, level_threshold):
+    # Return True when the current verbosity meets the threshold
+    return getattr(args, "verbose", 0) >= level_threshold and not getattr(args, "quiet", False)
+
+def log_error(args, message):
+    # Errors are always shown
+    print(f"ERROR: {message}", file=sys.stderr)
+
+def log_warning(args, message):
+    if _should_log(args, 0):
+        print(f"WARNING: {message}", file=sys.stderr)
+
+def log_info(args, message):
+    if _should_log(args, 1):
+        print(f"INFO: {message}", file=sys.stderr)
+
+def log_debug(args, message):
+    if _should_log(args, 5):
+        print(f"DEBUG: {message}", file=sys.stderr)
+# ----------------------------------------------------------------------
+
 
 def upload_file(api_token, audio_input, args):
     if audio_input.startswith('http://') or audio_input.startswith('https://'):
@@ -21,13 +48,13 @@ def upload_file(api_token, audio_input, args):
             response = requests.post(url, headers=headers, data=f)
         response.raise_for_status()
         upload_url = response.json()['upload_url']
-        if args.verbose:
-            print(f"File uploaded. URL: {upload_url}")
+        log_info(args, f"File uploaded. URL: {upload_url}")
+        log_debug(args, f"Upload response JSON: {response.text}")
         return upload_url
     except Exception as e:
-        print(f"Error in upload_file: {e}")
+        log_error(args, f"Error in upload_file: {e}")
         if response:
-            print(f"REST RESPONSE: {response.text}")
+            log_error(args, f"REST RESPONSE: {response.text}")
         raise
 
 def create_transcript(api_token, audio_url, speaker_labels, args):
@@ -45,13 +72,14 @@ def create_transcript(api_token, audio_url, speaker_labels, args):
         data["language_code"] = args.language
     if args.expected_speakers != -1:
         data["speakers_expected"] = args.expected_speakers
+
+    log_debug(args, f"Transcript request payload: {json.dumps(data)}")
     
     try:
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
         transcript_id = response.json()['id']
-        if args.verbose:
-            print(f"Transcript ID: {transcript_id}")
+        log_info(args, f"Transcript ID: {transcript_id}")
         
         polling_endpoint = f"{args.base_url}/v2/transcript/{transcript_id}"
         while True:
@@ -59,8 +87,8 @@ def create_transcript(api_token, audio_url, speaker_labels, args):
             response.raise_for_status()
             transcription_result = response.json()
             status = transcription_result['status']
-            if args.verbose:
-                print(f"Current status: {status}")
+            log_info(args, f"Current status: {status}")
+            log_debug(args, f"Full status JSON: {json.dumps(transcription_result)}")
             if status == "completed":
                 return transcription_result
             elif status == "error":
@@ -70,9 +98,9 @@ def create_transcript(api_token, audio_url, speaker_labels, args):
             else:
                 raise Exception(f"Unknown status: {status}")
     except Exception as e:
-        print(f"Error in create_transcript: {e}")
+        log_error(args, f"Error in create_transcript: {e}")
         if response:
-            print(f"REST RESPONSE: {response.text}")
+            log_error(args, f"REST RESPONSE: {response.text}")
         raise
 
 def write_str(args, output, string, mode='w'):
@@ -87,8 +115,8 @@ def write_transcript_to_file(args, output, transcript, audio_input):
     args_force_quiet = copy.deepcopy(args)
     args_force_quiet.quiet = True
     write_str(args_force_quiet, audio_input + '.assemblyai.json', json.dumps(transcript))
-    if args.verbose and not args.quiet:
-        print(f"Server response written to {audio_input + '.assemblyai.json'}")
+    if not args.quiet:
+        log_info(args, f"Server response written to {audio_input + '.assemblyai.json'}")
     
     if args.diarisation:
         for utterance in transcript['utterances']:
@@ -97,16 +125,15 @@ def write_transcript_to_file(args, output, transcript, audio_input):
     else:
         write_str(args, output, transcript['text'] + '\n')
 
-    if output != '-' and args.verbose and not args.quiet:
-        print(f"Output written to {output}")
+    if output != '-' and not args.quiet:
+        log_info(args, f"Output written to {output}")
 
 def stt_assemblyai_main(args, api_token):
     audio_input = args.audio_input
     speaker_labels = args.diarisation
 
     try:
-        if args.verbose:
-            print("Processing audio input...")
+        log_info(args, "Processing audio input...")
 
         # Determine the output file
         if args.output == '-':
@@ -114,8 +141,7 @@ def stt_assemblyai_main(args, api_token):
             output = potential_output if os.path.exists(potential_output) else '-'
         else:
             output = args.output if args.output is not None else audio_input + '.txt'
-        if args.verbose:
-            print(f"output filename: {output}")
+        log_info(args, f"output filename: {output}")
         
         # Check if output file exists before making the transcript
         if os.path.exists(output):
@@ -127,21 +153,17 @@ def stt_assemblyai_main(args, api_token):
             sys.exit(0)
         
         # Create the transcript
-        if args.verbose:
-            print("Uploading audio file...")
+        log_info(args, "Uploading audio file...")
         upload_url = upload_file(api_token, audio_input, args)
-        if args.verbose:
-            print("Creating transcript...")
+        log_info(args, "Creating transcript...")
         transcript = create_transcript(api_token, upload_url, speaker_labels, args)
         
         # Write the transcript to the output file
-        if args.verbose:
-            print("Transcript created. Writing output...")
+        log_info(args, "Transcript created. Writing output...")
         write_transcript_to_file(args, output, transcript, audio_input)
-        if args.verbose:
-            print("Done.")
+        log_info(args, "Done.")
     except Exception as e:
-        print(f'Error: {e}')
+        log_error(args, f'Error: {e}')
         sys.exit(1)
 
 def make_arg_parser():
@@ -153,7 +175,8 @@ def make_arg_parser():
     parser.add_argument('-e', '--expected-speakers', type=int, default=-1, help='The expected number of speakers for diarisation. This helps improve the accuracy of speaker labelling.')
     parser.add_argument('-l', '--language', type=str, default='auto', help='The dominant language in the audio file. Example codes: en, en_au, en_uk, en_us, es, fr, de, it, pt, nl, hi, ja, zh, fi, ko, pl, ru. Default is "auto" for automatic language detection.')
     parser.add_argument('-R', '--region', choices=['eu','us'], default='eu', help='Select region for API endpoints: "eu" or "us". Defaults to EU')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging. This will print detailed logs during the execution of the script.')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help='Increase verbosity. Use -v for INFO, -vv for more detail, up to -vvvvv for DEBUG output.')
     return parser
 
 if __name__ == "__main__":
