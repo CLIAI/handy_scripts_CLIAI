@@ -6,9 +6,8 @@ import argparse
 import sys
 import json
 
-import subprocess
 
-def upload_file(api_token, audio_input):
+def upload_file(api_token, audio_input, args):
     if audio_input.startswith('http://') or audio_input.startswith('https://'):
         return audio_input
     url = f"{args.base_url}/v2/upload"
@@ -16,6 +15,7 @@ def upload_file(api_token, audio_input):
         'authorization': api_token,
         'content-type': 'application/octet-stream'
     }
+    response = None  # ensure defined for exception handling
     try:
         with open(audio_input, 'rb') as f:
             response = requests.post(url, headers=headers, data=f)
@@ -30,12 +30,13 @@ def upload_file(api_token, audio_input):
             print(f"REST RESPONSE: {response.text}")
         raise
 
-def create_transcript(api_token, audio_url, speaker_labels):
+def create_transcript(api_token, audio_url, speaker_labels, args):
     url = f"{args.base_url}/v2/transcript"
     headers = {
         "authorization": api_token,
         "content-type": "application/json"
     }
+    response = None  # ensure defined for exception handling
     data = {
         "audio_url": audio_url,
         "speaker_labels": speaker_labels,
@@ -87,7 +88,7 @@ def write_transcript_to_file(args, output, transcript, audio_input):
     args_force_quiet.quiet = True
     write_str(args_force_quiet, audio_input + '.assemblyai.json', json.dumps(transcript))
     if args.verbose and not args.quiet:
-        print(f"Server response written to {output}.response")
+        print(f"Server response written to {audio_input + '.assemblyai.json'}")
     
     if args.diarisation:
         for utterance in transcript['utterances']:
@@ -128,10 +129,10 @@ def stt_assemblyai_main(args, api_token):
         # Create the transcript
         if args.verbose:
             print("Uploading audio file...")
-        upload_url = upload_file(api_token, audio_input)
+        upload_url = upload_file(api_token, audio_input, args)
         if args.verbose:
             print("Creating transcript...")
-        transcript = create_transcript(api_token, upload_url, speaker_labels)
+        transcript = create_transcript(api_token, upload_url, speaker_labels, args)
         
         # Write the transcript to the output file
         if args.verbose:
