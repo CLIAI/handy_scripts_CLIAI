@@ -11,7 +11,7 @@ import subprocess
 def upload_file(api_token, audio_input):
     if audio_input.startswith('http://') or audio_input.startswith('https://'):
         return audio_input
-    url = 'https://api.eu.assemblyai.com/v2/upload'
+    url = f"{args.base_url}/v2/upload"
     headers = {
         'authorization': api_token,
         'content-type': 'application/octet-stream'
@@ -31,7 +31,7 @@ def upload_file(api_token, audio_input):
         raise
 
 def create_transcript(api_token, audio_url, speaker_labels):
-    url = "https://api.eu.assemblyai.com/v2/transcript"
+    url = f"{args.base_url}/v2/transcript"
     headers = {
         "authorization": api_token,
         "content-type": "application/json"
@@ -52,7 +52,7 @@ def create_transcript(api_token, audio_url, speaker_labels):
         if args.verbose:
             print(f"Transcript ID: {transcript_id}")
         
-        polling_endpoint = f"https://api.eu.assemblyai.com/v2/transcript/{transcript_id}"
+        polling_endpoint = f"{args.base_url}/v2/transcript/{transcript_id}"
         while True:
             response = requests.get(polling_endpoint, headers=headers)
             response.raise_for_status()
@@ -151,6 +151,7 @@ def make_arg_parser():
     parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all status messages to standard output. If an output file is specified, the result will still be saved to that file (or standard output if `-` is specified).')
     parser.add_argument('-e', '--expected-speakers', type=int, default=-1, help='The expected number of speakers for diarisation. This helps improve the accuracy of speaker labelling.')
     parser.add_argument('-l', '--language', type=str, default='auto', help='The dominant language in the audio file. Example codes: en, en_au, en_uk, en_us, es, fr, de, it, pt, nl, hi, ja, zh, fi, ko, pl, ru. Default is "auto" for automatic language detection.')
+    parser.add_argument('-R', '--region', choices=['eu','us'], default='eu', help='Select region for API endpoints: "eu" or "us". Defaults to EU')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging. This will print detailed logs during the execution of the script.')
     return parser
 
@@ -162,4 +163,6 @@ if __name__ == "__main__":
         sys.exit(1)
     parser = make_arg_parser()
     args = parser.parse_args()
+    # Set base URL based on region selection
+    args.base_url = 'https://api.eu.assemblyai.com' if args.region == 'eu' else 'https://api.assemblyai.com'
     stt_assemblyai_main(args, api_token)
