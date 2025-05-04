@@ -32,8 +32,65 @@ def log_debug(args, message):
     if _should_log(args, 5):
         print(f"DEBUG: {message}", file=sys.stderr)
 # ----------------------------------------------------------------------
-
-
+ 
+# ----------------------------- FILENAME HELPERS ------------------------------
+# Many operating systems limit a single path component to 255 bytes.
+# Very long source filenames can therefore break file writes. These helpers
+# detect over-long filenames and truncate only the *basename* while keeping a
+# chained extension such as ".mp4.assemblyai.json" intact.
+# -----------------------------------------------------------------------------
+ 
+KNOWN_EXTENSIONS = {
+    "mp3", "mp4", "wav", "flac", "m4a", "ogg",
+    "json", "txt", "srt", "vtt", "md",
+    "assemblyai"
+}
+ 
+ 
+def _split_known_suffix(filename, known_extensions=KNOWN_EXTENSIONS):
+    """
+    Return (basename, chained_suffix_with_dot)
+    Example:
+        >>> _split_known_suffix("foo.bar.mp4.assemblyai.json")
+        ('foo.bar', '.mp4.assemblyai.json')
+    """
+    parts = filename.split(".")
+    if len(parts) == 1:
+        return filename, ""
+ 
+    suffix_parts = []
+    for part in reversed(parts[1:]):  # skip first chunk
+        if part.lower() in known_extensions:
+            suffix_parts.insert(0, part)
+        else:
+            break
+ 
+    if suffix_parts:
+        suffix = "." + ".".join(suffix_parts)
+        base_parts_count = len(parts) - len(suffix_parts)
+        basename = ".".join(parts[:base_parts_count])
+        return basename, suffix
+    else:
+        basename, ext = os.path.splitext(filename)
+        return basename, ext
+ 
+ 
+def make_safe_filename(path, max_component_length=255):
+    """
+    Ensure the final component of *path* is <= max_component_length bytes.
+    If it is longer, truncate the basename until it fits.
+    """
+    dir_name, file_name = os.path.split(path)
+    if len(file_name.encode()) <= max_component_length:
+        return path
+ 
+    base, suffix = _split_known_suffix(file_name)
+    allowed = max(1, max_component_length - len(suffix.encode()))
+    truncated_base = base.encode()[:allowed].decode(errors="ignore")
+    safe_name = truncated_base + suffix
+    return os.path.join(dir_name, safe_name)
+ 
+ 
 def upload_file(api_token, audio_input, args):
     if audio_input.startswith('http://') or audio_input.startswith('https://'):
         return audio_input
@@ -114,9 +171,10 @@ def write_transcript_to_file(args, output, transcript, audio_input):
     import copy
     args_force_quiet = copy.deepcopy(args)
     args_force_quiet.quiet = True
-    write_str(args_force_quiet, audio_input + '.assemblyai.json', json.dumps(transcript))
+    json_path = make_safe_filename(audio_input + '.assemblyai.json')
+    write_str(args_force_quiet, json_path, json.dumps(transcript))
     if not args.quiet:
-        log_info(args, f"Server response written to {audio_input + '.assemblyai.json'}")
+        log_info(args, f"Server response written to {json_path}")
     
     if args.diarisation:
         for utterance in transcript['utterances']:
@@ -156,6 +214,7 @@ def stt_assemblyai_main(args, api_token):
             output = potential_output if os.path.exists(potential_output) else '-'
         else:
             output = args.output if args.output is not None else audio_input + '.txt'
+            output = make_safe_filename(output)
         log_info(args, f"output filename: {output}")
         
         # Check if output file exists before making the transcript
