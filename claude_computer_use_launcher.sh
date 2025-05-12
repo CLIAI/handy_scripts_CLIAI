@@ -7,19 +7,34 @@
 # Handy script to launch Claude Computer Use:
 # https://github.com/anthropics/anthropic-quickstarts/tree/main/computer-use-demo
 
-# You can override settings by setting environment variables before running this script.
-# e.g.:
-# export ANTHROPIC_API_KEY=your_api_key
-# export CLAUDE_COMPUTER_USE_VOLUME=your_volume_name
-# export CLAUDE_COMPUTER_USE_PORT_VNC=your_vnc_port
-# export CLAUDE_COMPUTER_USE_PORT_STREAMLIT=your_streamlit_port
-# export CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW=your_desktop_view_port
-# export CLAUDE_COMPUTER_USE_PORT=your_full_interface_port
-# Then run the script:
-# ./claude_computer_use_launcher.sh
+# IMPORTANT NOTE ABOUT PORTS:
+#
+# While this script contains code that *appears* to allow you to override the default ports
+# (VNC, Streamlit, Desktop View, Full Interface) by setting environment variables before running,
+# the current implementation of the Claude Computer Use container does NOT support changing the
+# internal ports it listens on. There is no way to inform the container which ports to use for its
+# web UIs or services. The container is hardcoded to use the following ports internally:
+#   - VNC: 5900
+#   - Streamlit: 8501
+#   - Desktop View: 6080
+#   - Full Interface: 8080
+#
+# You *must* use the default port mappings as shown below. Setting the environment variables for
+# ports will only change the *host* side of the mapping, but the container will still expect the
+# above ports internally. Changing the host ports may break the web UI or other features.
+#
+# Until Anthropic provides a way to configure the container's internal ports, you should use the
+# default ports as shown in this script.
+#
+# For more details and to track progress on this limitation, see:
+#   https://github.com/anthropics/anthropic-quickstarts/issues/271
+#
+# Example usage:
+#   export ANTHROPIC_API_KEY=your_api_key
+#   ./claude_computer_use_launcher.sh
 #
 # Or inline:
-# ANTHROPIC_API_KEY=your_api_key CLAUDE_COMPUTER_USE_VOLUME=your_volume_name CLAUDE_COMPUTER_USE_PORT_VNC=2222 CLAUDE_COMPUTER_USE_PORT_STREAMLIT=3333 CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW=4444 CLAUDE_COMPUTER_USE_PORT=5555 ./claude_computer_use_launcher.sh
+#   ANTHROPIC_API_KEY=your_api_key ./claude_computer_use_launcher.sh
 
 if [ -z "$ANTHROPIC_API_KEY" ]; then
   echo "Please set the ANTHROPIC_API_KEY environment variable."
@@ -30,9 +45,10 @@ fi
 CLAUDE_COMPUTER_USE_VOLUME="${CLAUDE_COMPUTER_USE_VOLUME:claude-computer-use}"
 
 # Set environment variables for port numbers, use defaults if not provided
-CLAUDE_COMPUTER_USE_PORT_VNC="${CLAUDE_COMPUTER_USE_PORT_VNC:-7701}"
-CLAUDE_COMPUTER_USE_PORT_STREAMLIT="${CLAUDE_COMPUTER_USE_PORT_STREAMLIT:-7702}"
-CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW="${CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW:-7703}"
+# NOTE: See the note above. These variables only affect the host side of the port mapping.
+CLAUDE_COMPUTER_USE_PORT_VNC="${CLAUDE_COMPUTER_USE_PORT_VNC:-5900}"
+CLAUDE_COMPUTER_USE_PORT_STREAMLIT="${CLAUDE_COMPUTER_USE_PORT_STREAMLIT:-8501}"
+CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW="${CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW:-6080}"
 CLAUDE_COMPUTER_USE_PORT="${CLAUDE_COMPUTER_USE_PORT:-8080}"
 
 # Volume mapping
