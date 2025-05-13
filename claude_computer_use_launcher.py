@@ -59,9 +59,9 @@ CLAUDE_COMPUTER_USE_VOLUME="${CLAUDE_COMPUTER_USE_VOLUME:-claude-computer-use}"
 echo "Starting Claude Computer Use with the following settings:"
 echo "* Using volume: $CLAUDE_COMPUTER_USE_VOLUME"
 echo "* VNC Port: $CLAUDE_COMPUTER_USE_PORT_VNC"
-echo "* Streamlit Port: $CLAUDE_COMPUTER_USE_PORT_STREAMLIT"
-echo "* Desktop View Port: $CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW"
-echo "* Full Interface Port: $CLAUDE_COMPUTER_USE_PORT"
+echo "* Streamlit Port: http://$CLAUDE_COMPUTER_USE_PORT_STREAMLIT"
+echo "* Desktop View Port: CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW"
+echo "* Full Interface Port: http://$CLAUDE_COMPUTER_USE_PORT"
 ) >&2
 
 # Set Bash verbosity to show commands as they are executed
