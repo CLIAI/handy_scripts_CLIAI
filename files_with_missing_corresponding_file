@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+
+"""
+Script to print filenames that do not have a corresponding file with a specified extension.
+A corresponding file could be named as either `[filename].EXT` or `[filename].[ext].EXT`, where EXT is configurable (default: json).
+
+It is useful e.g. to identify which files to annotate, e.g. freshly created by AI tools or downloaded from replicate.
+
+Example usage:
+
+    vim -p $(files_with_missing_corresponding_file *.png)
+    files_with_missing_corresponding_file -e yaml *.png
+    files_with_missing_corresponding_file --ext meta *.jpg
+
+Usage:
+* Without arguments, the script checks all files in the current directory.
+* With arguments, the script checks only the specified files.
+* Use -e EXT or --ext EXT to specify a different extension (default: json).
+* Use -h or --help to show this help message.
+"""
+
+import os
+import sys
+import argparse
+
+def has_no_corresponding_file(filename, ext):
+    """
+    Check if there is no corresponding file with the given extension for the given file.
+
+    Parameters:
+    filename (str): The name of the file to check.
+    ext (str): The extension to check for (without dot).
+
+    Returns:
+    bool: True if there is no corresponding file, False otherwise.
+    """
+    base_name = os.path.splitext(filename)[0]
+    extension = os.path.splitext(filename)[1]
+
+    file1 = f"{base_name}.{ext}"
+    file2 = f"{base_name}{extension}.{ext}"
+
+    return not (os.path.isfile(file1) or os.path.isfile(file2))
+
+def main(files, ext):
+    """
+    Main function to iterate through the files and check for corresponding files with the given extension.
+
+    Parameters:
+    files (list): List of file names to check.
+    ext (str): The extension to check for (without dot).
+    """
+    for file in files:
+        if not os.path.isdir(file) and not file.endswith(f".{ext}"):
+            if has_no_corresponding_file(file, ext):
+                print(f"{file}.{ext}")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Print filenames that do not have a corresponding file with a specified extension (default: json).",
+        add_help=False
+    )
+    parser.add_argument(
+        "-e", "--ext", default="json", metavar="EXT",
+        help="Extension to check for (default: json)"
+    )
+    parser.add_argument(
+        "-h", "--help", action="help",
+        help="Show this help message and exit"
+    )
+    parser.add_argument(
+        "files", nargs="*", help="Files to check (default: all files in current directory)"
+    )
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.files:
+        files_to_check = args.files
+    else:
+        files_to_check = [f for f in os.listdir('.') if os.path.isfile(f)]
+    ext = args.ext
+    if ext.startswith('.'):
+        ext = ext[1:]
+    main(files_to_check, ext)
+
