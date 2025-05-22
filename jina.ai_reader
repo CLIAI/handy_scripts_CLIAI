@@ -11,6 +11,11 @@ import argparse
 import requests
 import json
 import re
+try:
+    # Use python-dotenv for robust .env parsing (handles comments, quotes, export, etc.)
+    from dotenv import dotenv_values
+except ImportError:  # Fallback if library is missing; handled later.
+    dotenv_values = None
 
 def url_to_filename(url, verbosity=0):
     """
@@ -110,6 +115,9 @@ def main():
                         help="Equivalent to --field content.")
     parser.add_argument("-d", "--description", action="store_true",
                         help="Equivalent to --field description.")
+    parser.add_argument("-k", "--key-file", dest="key_file",
+                        help="Path to a .env-like file that contains a line such as "
+                             "'JINA_API_KEY=...' or 'export JINA_API_KEY=...'.")
 
     # New flags:
     parser.add_argument("-o", "--output",
@@ -138,12 +146,42 @@ def main():
         "Content-Type": "application/json"
     }
 
-    # If JINA_API_KEY is present in the environment, set Authorization
-    jina_api_key = os.environ.get("JINA_API_KEY")
+    # Resolve API key:
+    # 1. If --key-file is provided, try to read the key from that file.
+    #    The file may contain either `JINA_API_KEY=...` or `export JINA_API_KEY=...`.
+    # 2. Otherwise, fall back to the JINA_API_KEY environment variable.
+    jina_api_key = None
+    if args.key_file:
+        # Use python-dotenv for robust Bash-compatible .env parsing
+        if dotenv_values is None:
+            if verbosity > 0:
+                print(
+                    "python-dotenv is required to parse key files. "
+                    "Install it with 'pip install python-dotenv'.",
+                    file=sys.stderr,
+                )
+            sys.exit(1)
+        try:
+            config = dotenv_values(args.key_file)
+        except Exception as e:
+            if verbosity > 0:
+                print(f"Error reading key file '{args.key_file}': {e}", file=sys.stderr)
+            sys.exit(1)
+
+        jina_api_key = config.get("JINA_API_KEY")
+        if not jina_api_key:
+            if verbosity > 0:
+                print(f"No JINA_API_KEY found in key file '{args.key_file}'.", file=sys.stderr)
+            sys.exit(1)
+        elif verbosity > 0:
+            print(f"Using JINA_API_KEY from key file '{args.key_file}'.", file=sys.stderr)
+    else:
+        jina_api_key = os.environ.get("JINA_API_KEY")
+        if jina_api_key and verbosity > 0:
+            print("Using JINA_API_KEY from environment.", file=sys.stderr)
+
     if jina_api_key:
         headers["Authorization"] = f"Bearer {jina_api_key}"
-        if verbosity > 0:
-            print("Using authorization header with JINA_API_KEY.", file=sys.stderr)
     else:
         if verbosity > 0:
             print("JINA_API_KEY not found; proceeding without authorization.", file=sys.stderr)
