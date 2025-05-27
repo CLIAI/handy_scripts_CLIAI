@@ -352,12 +352,23 @@ def main():
         def all_list():
             return ["json", "content", "title", "description", "links", "images", "text", "markdown", "html"]
 
+        # Validate and expand the list of requested items
+        VALID_SAVE_ITEMS = set(all_list() + ["screenshot", "pageshot"])
+
         expanded_items = []
         for token in raw_list:
-            if token == "all":
+            token_lower = token.lower()
+            if token_lower == "all":
                 expanded_items.extend(all_list())
+            elif token_lower in VALID_SAVE_ITEMS:
+                expanded_items.append(token_lower)
             else:
-                expanded_items.append(token)
+                print(
+                    f"Error: invalid token '{token}' for --save-all. "
+                    f"Valid options are: {', '.join(sorted(VALID_SAVE_ITEMS | {'all'}))}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         # Ensure we add the main_item at the front if not present
         all_seen = set()
