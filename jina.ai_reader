@@ -266,13 +266,17 @@ def main():
         'item' can be:
           - 'json': the entire JSON string
           - 'text' / 'markdown' / 'html' / 'screenshot' / 'pageshot'
-          - recognized field among 'content', 'title', 'description', 'links', 'images'
+          - recognized field among 'content', 'title', 'description', 'links', 'images', 'url'
         """
         # TODO: Enhance to properly handle different return formats
         # Each return format may have a different structure for each field
         # Return entire JSON
         if item == "json":
             return json.dumps(full_data, indent=2, ensure_ascii=False)
+
+        # Special case: original URL
+        if item == "url":
+            return args.url
 
         # For these, read from data["data"].(item) if present
         if item in ["text", "markdown", "html", "screenshot", "pageshot"]:
@@ -290,6 +294,9 @@ def main():
         # 'json' => .json
         if item == "json":
             return ".json"
+        # 'url' => .url
+        if item == "url":
+            return ".url"
 
         # If there's a recognized format, pick extension
         if r_format == "markdown":
@@ -350,7 +357,7 @@ def main():
         # We'll define "all" as: json, content, title, description, links, images, text, markdown, html
         # We won't forcibly produce screenshot/pageshot unless user specifically asks, to limit confusion
         def all_list():
-            return ["json", "content", "title", "description", "links", "images", "text", "markdown", "html"]
+            return ["json", "content", "title", "description", "links", "images", "text", "markdown", "html", "url"]
 
         # Validate and expand the list of requested items
         VALID_SAVE_ITEMS = set(all_list() + ["screenshot", "pageshot"])
@@ -394,6 +401,9 @@ def main():
             # For the 'main_item', we don't want a .markdown.md scenario, so skip appending the item if it matches
             # Example: if user typed -F markdown, main_item=markdown => file.md
             if item == main_item:
+                out_filename = f"{args.output}{ext}"
+            # Avoid double extension like .url.url
+            elif ext == f".{item}":
                 out_filename = f"{args.output}{ext}"
             else:
                 out_filename = f"{args.output}.{item}{ext}"
