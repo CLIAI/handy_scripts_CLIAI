@@ -1,9 +1,8 @@
 #!/bin/bash
 
-# This file is a bash script, but you are trying to run it with Python.
-# To fix the error, run it with bash, not python:
-#   bash claude_computer_use_launcher.py
-# Or rename it to .sh for clarity.
+# This file is a bash script, not a Python script.
+# To run: bash claude_computer_use_launcher.py
+# Or rename to .sh for clarity.
 
 show_help() {
   cat <<'EOF'
