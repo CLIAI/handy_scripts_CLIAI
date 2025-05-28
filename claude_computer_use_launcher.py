@@ -1,5 +1,69 @@
 #!/bin/bash
 
+show_help() {
+  cat <<EOF
+claude_computer_use_launcher.sh - Launch Claude Computer Use in Docker
+
+Purpose:
+  This script launches the Anthropic Claude Computer Use demo container, providing a GUI environment
+  and agent for task automation via Claude. It sets up the required Docker container, port mappings,
+  and persistent volume for configuration and data.
+
+Features:
+  - Launches the Claude Computer Use demo container from Anthropic's repository.
+  - Exposes the following interfaces on your host:
+      * VNC (default: 5900)
+      * Streamlit UI (default: 8501)
+      * Desktop View (default: 6080)
+      * Full Interface (default: 8080)
+  - Allows overriding host-side port mappings via environment variables.
+  - Persists configuration using a Docker volume (default: claude-computer-use).
+
+Flags / Environment Variables:
+  -h, --help
+      Show this help message and exit.
+
+  ANTHROPIC_API_KEY
+      (Required) Your Anthropic API key.
+
+  CLAUDE_COMPUTER_USE_VOLUME
+      Docker volume name for persistent data (default: claude-computer-use).
+
+  CLAUDE_COMPUTER_USE_PORT_VNC
+      Host port for VNC (default: 5900).
+
+  CLAUDE_COMPUTER_USE_PORT_STREAMLIT
+      Host port for Streamlit UI (default: 8501).
+
+  CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW
+      Host port for Desktop View (default: 6080).
+
+  CLAUDE_COMPUTER_USE_PORT
+      Host port for Full Interface (default: 8080).
+
+Example usage:
+  export ANTHROPIC_API_KEY=your_api_key
+  ./claude_computer_use_launcher.sh
+
+  Or inline:
+  ANTHROPIC_API_KEY=your_api_key ./claude_computer_use_launcher.sh
+
+For more information, see:
+  https://github.com/anthropics/anthropic-quickstarts/tree/main/computer-use-demo
+
+EOF
+}
+
+# Check for -h or --help flags
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+  esac
+done
+
 # Just lanuching script will use docker container from Anthropic's repository
 # to launch Claude Computer Use, that is running container with GUI graphical
 # enviornment and agent performing tasks.
