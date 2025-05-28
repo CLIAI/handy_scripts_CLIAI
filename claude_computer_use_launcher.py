@@ -31,7 +31,17 @@ Flags / Environment Variables:
       (Required) Your Anthropic API key.
 
   CLAUDE_COMPUTER_USE_VOLUME
-      Docker volume name for persistent data (default: claude-computer-use).
+      Docker volume name for persistent data in /home/computeruse/.anthropic (default: claude-computer-use).
+
+  CLAUDE_COMPUTER_USE_HOME_VOLUME
+      Docker volume name for the *entire* /home directory (default: claude-computer-use-home).
+      Set to "none" to disable mounting the home directory.
+
+  --reset-config-volume, --reset-volume
+      Remove the configuration volume then exit.
+
+  --reset-home-volume
+      Remove the home directory volume then exit.
 
   CLAUDE_COMPUTER_USE_PORT_VNC
       Host port for VNC (default: 5900).
@@ -58,12 +68,21 @@ For more information, see:
 EOF
 }
 
-# Check for -h or --help flags
+# Handle CLI flags
+RESET_HOME_VOLUME=false
+RESET_CONFIG_VOLUME=false
+
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
       show_help
       exit 0
+      ;;
+    --reset-home-volume)
+      RESET_HOME_VOLUME=true
+      ;;
+    --reset-config-volume|--reset-volume)
+      RESET_CONFIG_VOLUME=true
       ;;
   esac
 done
@@ -109,8 +128,43 @@ if [ -z "$ANTHROPIC_API_KEY" ]; then
   exit 1
 fi
 
-# Set the volume name for Claude Computer Use, if not already set
+# Volume settings
+# Persistent volume for Claude-specific configuration (can be disabled by setting to 'none')
 CLAUDE_COMPUTER_USE_VOLUME="${CLAUDE_COMPUTER_USE_VOLUME:-claude-computer-use}"
+
+# Persistent volume for the *entire* home directory of the container user.
+# Set CLAUDE_COMPUTER_USE_HOME_VOLUME=none to disable.
+CLAUDE_COMPUTER_USE_HOME_VOLUME="${CLAUDE_COMPUTER_USE_HOME_VOLUME:-claude-computer-use-home}"
+
+# Convert 'none' → empty string so we can skip the mount later
+if [ "$CLAUDE_COMPUTER_USE_HOME_VOLUME" = "none" ]; then
+  CLAUDE_COMPUTER_USE_HOME_VOLUME=""
+fi
+if [ "$CLAUDE_COMPUTER_USE_VOLUME" = "none" ]; then
+  CLAUDE_COMPUTER_USE_VOLUME=""
+fi
+
+# Perform cleanup tasks requested by flags
+if $RESET_HOME_VOLUME ; then
+  echo "Removing home volume: ${CLAUDE_COMPUTER_USE_HOME_VOLUME:-claude-computer-use-home}"
+  docker volume rm -f "${CLAUDE_COMPUTER_USE_HOME_VOLUME:-claude-computer-use-home}" 2>/dev/null || true
+  exit 0
+fi
+
+if $RESET_CONFIG_VOLUME ; then
+  echo "Removing config volume: ${CLAUDE_COMPUTER_USE_VOLUME:-claude-computer-use}"
+  docker volume rm -f "${CLAUDE_COMPUTER_USE_VOLUME:-claude-computer-use}" 2>/dev/null || true
+  exit 0
+fi
+
+# Build volume flags array for docker run
+DOCKER_VOLUME_FLAGS=()
+if [ -n "$CLAUDE_COMPUTER_USE_HOME_VOLUME" ]; then
+  DOCKER_VOLUME_FLAGS+=(-v "$CLAUDE_COMPUTER_USE_HOME_VOLUME":/home/computeruse)
+fi
+if [ -n "$CLAUDE_COMPUTER_USE_VOLUME" ]; then
+  DOCKER_VOLUME_FLAGS+=(-v "$CLAUDE_COMPUTER_USE_VOLUME":/home/computeruse/.anthropic)
+fi
 
 # Set environment variables for port numbers, use defaults if not provided
 # NOTE: See the note above. These variables only affect the host side of the port mapping.
@@ -119,13 +173,13 @@ CLAUDE_COMPUTER_USE_PORT_STREAMLIT="${CLAUDE_COMPUTER_USE_PORT_STREAMLIT:-8501}"
 CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW="${CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW:-6080}"
 CLAUDE_COMPUTER_USE_PORT="${CLAUDE_COMPUTER_USE_PORT:-8080}"
 
-# Volume mapping
-CLAUDE_COMPUTER_USE_VOLUME="${CLAUDE_COMPUTER_USE_VOLUME:-claude-computer-use}"
+# (Volume variables are defined above)
 
 # Echo to stderror which ports are being used for what
 (
 echo "Starting Claude Computer Use with the following settings:"
-echo "* Using volume: $CLAUDE_COMPUTER_USE_VOLUME"
+echo "* Home Volume (entire /home): ${CLAUDE_COMPUTER_USE_HOME_VOLUME:-'<disabled>'}"
+echo "* Config Volume (/home/computeruse/.anthropic): ${CLAUDE_COMPUTER_USE_VOLUME:-'<disabled>'}"
 echo "* VNC Port: $CLAUDE_COMPUTER_USE_PORT_VNC"
 echo "* Streamlit Port: http://$CLAUDE_COMPUTER_USE_PORT_STREAMLIT"
 echo "* Desktop View Port: $CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW"
@@ -139,7 +193,7 @@ set -x
 # Docker run command
 docker run \
   -e ANTHROPIC_API_KEY \
-  -v "$CLAUDE_COMPUTER_USE_VOLUME":/home/computeruse/.anthropic \
+  "${DOCKER_VOLUME_FLAGS[@]}" \
   -p "$CLAUDE_COMPUTER_USE_PORT_VNC":5900 \
   -p "$CLAUDE_COMPUTER_USE_PORT_STREAMLIT":8501 \
   -p "$CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW":6080 \
