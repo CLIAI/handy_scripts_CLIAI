@@ -1,7 +1,7 @@
 #!/bin/bash
 
 show_help() {
-  cat <<EOF
+  cat <<'EOF'
 claude_computer_use_launcher.sh - Launch Claude Computer Use in Docker
 
 Purpose:
@@ -106,7 +106,7 @@ if [ -z "$ANTHROPIC_API_KEY" ]; then
 fi
 
 # Set the volume name for Claude Computer Use, if not already set
-CLAUDE_COMPUTER_USE_VOLUME="${CLAUDE_COMPUTER_USE_VOLUME:claude-computer-use}"
+CLAUDE_COMPUTER_USE_VOLUME="${CLAUDE_COMPUTER_USE_VOLUME:-claude-computer-use}"
 
 # Set environment variables for port numbers, use defaults if not provided
 # NOTE: See the note above. These variables only affect the host side of the port mapping.
@@ -124,7 +124,7 @@ echo "Starting Claude Computer Use with the following settings:"
 echo "* Using volume: $CLAUDE_COMPUTER_USE_VOLUME"
 echo "* VNC Port: $CLAUDE_COMPUTER_USE_PORT_VNC"
 echo "* Streamlit Port: http://$CLAUDE_COMPUTER_USE_PORT_STREAMLIT"
-echo "* Desktop View Port: CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW"
+echo "* Desktop View Port: $CLAUDE_COMPUTER_USE_PORT_DESKTOP_VIEW"
 echo "* Full Interface Port: http://$CLAUDE_COMPUTER_USE_PORT"
 ) >&2
 
