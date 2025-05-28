@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# This file is a bash script, but you are trying to run it with Python.
+# To fix the error, run it with bash, not python:
+#   bash claude_computer_use_launcher.py
+# Or rename it to .sh for clarity.
+
 show_help() {
   cat <<'EOF'
 claude_computer_use_launcher.sh - Launch Claude Computer Use in Docker
