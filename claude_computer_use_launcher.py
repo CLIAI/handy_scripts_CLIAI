@@ -1,8 +1,10 @@
-#!/bin/bash
-
-# This file is a bash script, not a Python script.
-# To run: bash claude_computer_use_launcher.py
-# Or rename to .sh for clarity.
+#!/usr/bin/env bash
+# flake8: noqa
+#
+# This file is a Bash script, not a Python script.
+# Recommended usage:
+#   bash claude_computer_use_launcher.sh
+# or simply rename the file to `.sh` and run it directly.
 
 show_help() {
   cat <<'EOF'
