@@ -128,6 +128,8 @@ def main():
                              "Possible items include 'json', 'content', 'title', 'description', 'links', 'images', "
                              "'text', 'markdown', 'html'. "
                              "Use 'all' to export all recognized fields plus 'json' (if available).")
+    parser.add_argument("--force", "-f", action="store_true",
+                        help="If set, create output files even if the content is empty (default: skip empty files).")
 
     args = parser.parse_args()
 
@@ -394,6 +396,12 @@ def main():
             out_str = get_data_string(item, data)
             if out_str is None:
                 out_str = ""
+
+            # If not --force, skip writing empty files
+            if not args.force and (out_str == "" or (isinstance(out_str, str) and out_str.strip() == "")):
+                if verbosity > 1:
+                    print(f"Skipping {item} (empty, not saving file).", file=sys.stderr)
+                continue
 
             # Deduce extension
             ext = detect_extension(normalized_rf, item)
