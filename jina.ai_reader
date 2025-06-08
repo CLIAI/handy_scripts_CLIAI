@@ -650,6 +650,9 @@ def main():
                 else:
                     field_value = data.get("data", {}).get(args.field)
                     if field_value is not None:
+                        # For dict/list fields, return JSON
+                        if isinstance(field_value, (dict, list)):
+                            return json.dumps(field_value, indent=2, ensure_ascii=False)
                         return str(field_value)
                     else:
                         return ""
