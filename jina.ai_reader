@@ -11,6 +11,12 @@ import argparse
 import requests
 import json
 import re
+import base64
+import mimetypes
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+from typing import Optional, Dict, Any, List
+
 try:
     # Use python-dotenv for robust .env parsing (handles comments, quotes, export, etc.)
     from dotenv import dotenv_values
@@ -28,10 +34,40 @@ def url_to_filename(url, verbosity=0):
     Returns:
         str: A filename-safe string derived from the URL
     """
-    # First, try to match against special patterns
-    # (This is a placeholder for future special case handlers)
+    # Handle special cases for common sites
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
     
-    # If no special case matched, use the generic handler
+    # GitHub URLs
+    if 'github.com' in domain:
+        parts = parsed.path.strip('/').split('/')
+        if len(parts) >= 2:
+            # Format: owner_repo[_extra]
+            result = '_'.join(parts[:3]).replace('/', '_')
+            return re.sub(r'[^a-zA-Z0-9_-]', '_', result)[:100]
+    
+    # Wikipedia URLs
+    if 'wikipedia.org' in domain:
+        # Extract article name from path
+        match = re.search(r'/wiki/(.+?)(?:\?|#|$)', parsed.path)
+        if match:
+            article = match.group(1).replace('_', '-')
+            return f"wiki_{re.sub(r'[^a-zA-Z0-9_-]', '_', article)}"[:100]
+    
+    # YouTube URLs
+    if 'youtube.com' in domain or 'youtu.be' in domain:
+        # Extract video ID
+        video_id = None
+        if 'youtube.com' in domain:
+            video_id = re.search(r'[?&]v=([^&]+)', url)
+            if video_id:
+                video_id = video_id.group(1)
+        elif 'youtu.be' in domain:
+            video_id = parsed.path.strip('/')
+        if video_id:
+            return f"youtube_{video_id}"
+    
+    # Default: use generic handler
     return generic_url_to_filename(url, verbosity)
 
 def generic_url_to_filename(url, verbosity=0):
@@ -47,23 +83,36 @@ def generic_url_to_filename(url, verbosity=0):
     """
     if verbosity > 1:
         print(f"Converting URL to filename: {url}", file=sys.stderr)
-        
-    # Remove protocol (http://, https://)
-    clean_url = re.sub(r'^https?://', '', url)
     
-    # Remove trailing slashes
-    clean_url = clean_url.rstrip('/')
+    # Parse URL to get meaningful parts
+    parsed = urlparse(url)
+    
+    # Start with domain
+    domain = parsed.netloc.replace('www.', '')
+    
+    # Add path if present
+    path = unquote(parsed.path).strip('/')
+    
+    # Combine domain and path
+    if path:
+        clean_url = f"{domain}_{path}"
+    else:
+        clean_url = domain
     
     # Replace all characters that aren't alphanumeric, underscore, or hyphen
-    # This ensures the result fits [a-zA-Z0-9_-]
     clean_url = re.sub(r'[^a-zA-Z0-9_-]', '_', clean_url)
     
     # Collapse multiple underscores into one
-    clean_url = re.sub(r'_+', '_', clean_url)
+    clean_url = re.sub(r'_+', '_', clean_url).strip('_')
     
     # Limit length to avoid excessively long filenames
     if len(clean_url) > 100:
-        clean_url = clean_url[:100]
+        # Try to keep the end part which often has more specific info
+        clean_url = clean_url[-100:]
+    
+    # Ensure we have a valid filename
+    if not clean_url:
+        clean_url = "jina_output"
     
     if verbosity > 1:
         print(f"Generated filename: {clean_url}", file=sys.stderr)
@@ -118,6 +167,16 @@ def main():
     parser.add_argument("-k", "--key-file", dest="key_file",
                         help="Path to a .env-like file that contains a line such as "
                              "'JINA_API_KEY=...' or 'export JINA_API_KEY=...'.")
+    parser.add_argument("--engine", choices=["browser", "direct", "cf-browser-rendering"],
+                        help="Content retrieval engine (X-Engine header).")
+    parser.add_argument("--respond-with", choices=["readerlm-v2", "no-content"],
+                        help="Specialized response mode (X-Respond-With header).")
+    parser.add_argument("--set-cookie",
+                        help="Custom cookie settings (X-Set-Cookie header).")
+    parser.add_argument("--proxy-url",
+                        help="Proxy URL for accessing the target (X-Proxy-Url header).")
+    parser.add_argument("--locale",
+                        help="Browser locale for rendering (X-Locale header, e.g., 'en-US').")
 
     # New flags:
     parser.add_argument("-o", "--output",
@@ -128,8 +187,10 @@ def main():
                              "Possible items include 'json', 'content', 'title', 'description', 'links', 'images', "
                              "'text', 'markdown', 'html'. "
                              "Use 'all' to export all recognized fields plus 'json' (if available).")
-    parser.add_argument("--force", "-f", action="store_true",
+    parser.add_argument("--force", action="store_true",
                         help="If set, create output files even if the content is empty (default: skip empty files).")
+    parser.add_argument("--download-images", action="store_true",
+                        help="When used with --save-all and images are included, download actual image files to a subfolder.")
 
     args = parser.parse_args()
 
@@ -224,6 +285,18 @@ def main():
         headers["X-Token-Budget"] = str(args.token_budget)
     if args.retain_images:
         headers["X-Retain-Images"] = args.retain_images
+    
+    # Additional headers from new arguments
+    if args.engine:
+        headers["X-Engine"] = args.engine
+    if args.respond_with:
+        headers["X-Respond-With"] = args.respond_with
+    if args.set_cookie:
+        headers["X-Set-Cookie"] = args.set_cookie
+    if args.proxy_url:
+        headers["X-Proxy-Url"] = args.proxy_url
+    if args.locale:
+        headers["X-Locale"] = args.locale
 
     # Shortcut flags
     if args.content:
@@ -239,16 +312,30 @@ def main():
     try:
         if verbosity > 0:
             print(f"Sending request to {endpoint} with provided parameters...", file=sys.stderr)
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+        # Use timeout from args if provided, otherwise default to 60 seconds
+        request_timeout = max(args.timeout if args.timeout else 60, 60)
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=request_timeout)
         response.raise_for_status()
         data = response.json()
+    except requests.exceptions.Timeout:
+        print(f"Error: Request timed out after {request_timeout} seconds", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        print("Error: Failed to connect to Jina AI Reader API. Check your internet connection.", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error {response.status_code}: {e}", file=sys.stderr)
+        if response.status_code == 401:
+            print("Authentication failed. Check your API key.", file=sys.stderr)
+        elif response.status_code == 429:
+            print("Rate limit exceeded. Please try again later.", file=sys.stderr)
+        sys.exit(1)
     except requests.exceptions.RequestException as e:
-        if verbosity > 0:
-            print(f"Error while making request to Jina AI Reader API: {e}", file=sys.stderr)
+        print(f"Error while making request to Jina AI Reader API: {e}", file=sys.stderr)
         sys.exit(1)
     except ValueError as e:
-        if verbosity > 0:
-            print(f"Error parsing JSON response from Jina AI Reader API: {e}", file=sys.stderr)
+        print(f"Error parsing JSON response from Jina AI Reader API: {e}", file=sys.stderr)
+        print(f"Response content: {response.text[:500]}...", file=sys.stderr)
         sys.exit(1)
 
     # =========================================================
@@ -270,8 +357,6 @@ def main():
           - 'text' / 'markdown' / 'html' / 'screenshot' / 'pageshot'
           - recognized field among 'content', 'title', 'description', 'links', 'images', 'url'
         """
-        # TODO: Enhance to properly handle different return formats
-        # Each return format may have a different structure for each field
         # Return entire JSON
         if item == "json":
             return json.dumps(full_data, indent=2, ensure_ascii=False)
@@ -280,38 +365,74 @@ def main():
         if item == "url":
             return args.url
 
-        # For these, read from data["data"].(item) if present
+        # Handle different response structures
+        # The response has 'data' field which contains the actual content
+        data_section = full_data.get("data", {})
+        
+        # For format-specific items - these might be in the root data section
         if item in ["text", "markdown", "html", "screenshot", "pageshot"]:
-            return full_data.get("data", {}).get(item, "")
+            # First check if it's directly in data section
+            value = data_section.get(item, "")
+            if not value and "content" in data_section:
+                # If not found, it might be the content field for certain formats
+                if item == normalized_rf:
+                    value = data_section.get("content", "")
+            return value
 
-        # For known fields: content, title, description, links, images
-        # TODO: Add special handling for 'images' to download image content when URLs are returned
-        # TODO: Determine appropriate naming convention for downloaded images
-        return full_data.get("data", {}).get(item, "")
+        # For field items
+        if item in ["content", "title", "description", "url"]:
+            return str(data_section.get(item, ""))
+        
+        # For links and images, these are returned as dictionaries with descriptive keys
+        # according to the docs: {"Image 1": "https://example.com/image.jpg"}
+        if item in ["links", "images"]:
+            value = data_section.get(item, {})
+            if isinstance(value, dict):
+                # Convert dict values to a list for easier processing
+                if item == "images":
+                    # Return list of image URLs for download functionality
+                    return json.dumps(list(value.values()), indent=2, ensure_ascii=False)
+                else:
+                    # Return the full dict for links
+                    return json.dumps(value, indent=2, ensure_ascii=False)
+            return json.dumps(value, indent=2, ensure_ascii=False)
+
+        # Default
+        return str(data_section.get(item, ""))
 
     def detect_extension(r_format, item):
         """
         Choose file extension based on return format or item.
         """
-        # 'json' => .json
-        if item == "json":
-            return ".json"
-        # 'url' => .url
-        if item == "url":
-            return ".url"
-
-        # If there's a recognized format, pick extension
-        if r_format == "markdown":
-            return ".md"
-        elif r_format == "html":
-            return ".html"
-        elif r_format == "text":
-            return ".txt"
-        elif r_format == "screenshot":
-            return ".png"
-        elif r_format == "pageshot":
-            return ".png"
-
+        # Direct mappings
+        extension_map = {
+            "json": ".json",
+            "url": ".url",
+            "markdown": ".md",
+            "html": ".html",
+            "text": ".txt",
+            "screenshot": ".png",
+            "pageshot": ".png",
+            "links": ".json",
+            "images": ".json"
+        }
+        
+        # Check item first
+        if item in extension_map:
+            return extension_map[item]
+        
+        # Then check format
+        if r_format in extension_map:
+            return extension_map[r_format]
+        
+        # Item-specific extensions
+        if item == "content":
+            # Content extension depends on the return format
+            if r_format == "markdown":
+                return ".md"
+            elif r_format == "html":
+                return ".html"
+        
         # Fallback
         return ".txt"
 
@@ -320,12 +441,19 @@ def main():
         Attempt to store the original url in extended attribute: user.xdg.origin.url
         If it fails, ignore unless verbosity > 0, then show a warning.
         """
-        # TODO: Verify compliance with xattr standards and best practices
         try:
-            os.setxattr(filename, "user.xdg.origin.url", url_val.encode('utf-8'))
-        except OSError as e:
-            if verbosity > 0:
-                print(f"Warning: could not set xattr user.xdg.origin.url on {filename}: {e}", file=sys.stderr)
+            # Check if system supports extended attributes
+            if hasattr(os, 'setxattr'):
+                os.setxattr(filename, "user.xdg.origin.url", url_val.encode('utf-8'))
+            elif sys.platform == 'darwin':
+                # macOS requires different attribute name format
+                import subprocess
+                subprocess.run(['xattr', '-w', 'com.apple.metadata:kMDItemWhereFroms', 
+                              f'("{url_val}")', filename], 
+                              capture_output=True, check=False)
+        except (OSError, AttributeError) as e:
+            if verbosity > 1:  # Only show in verbose mode
+                print(f"Note: Extended attributes not supported on this system: {e}", file=sys.stderr)
 
     # If --save-all is used, we produce multiple output files
     if args.save_all:
@@ -397,6 +525,57 @@ def main():
             if out_str is None:
                 out_str = ""
 
+            # Special handling for images - download actual image files
+            if item == "images" and args.download_images:
+                # Parse the images JSON and download each image
+                try:
+                    images_data = json.loads(out_str) if isinstance(out_str, str) else out_str
+                    if isinstance(images_data, list) and images_data:
+                        images_dir = f"{args.output}_images"
+                        os.makedirs(images_dir, exist_ok=True)
+                        
+                        downloaded_images = []
+                        for idx, img_url in enumerate(images_data):
+                            if isinstance(img_url, str) and img_url.startswith(('http://', 'https://')):
+                                try:
+                                    # Use a proper User-Agent for Wikipedia images
+                                    img_headers = {
+                                        'User-Agent': 'JinaAIReader/1.0 (https://github.com/user/jina-reader-cli; contact@example.com)'
+                                    }
+                                    img_response = requests.get(img_url, headers=img_headers, timeout=30)
+                                    img_response.raise_for_status()
+                                    
+                                    # Determine file extension from content-type
+                                    content_type = img_response.headers.get('content-type', '')
+                                    ext = mimetypes.guess_extension(content_type) or '.jpg'
+                                    
+                                    img_filename = os.path.join(images_dir, f"image_{idx:03d}{ext}")
+                                    with open(img_filename, 'wb') as img_file:
+                                        img_file.write(img_response.content)
+                                    
+                                    downloaded_images.append({
+                                        "url": img_url,
+                                        "local_path": img_filename
+                                    })
+                                    
+                                    if verbosity > 0:
+                                        print(f"Downloaded image {idx+1}/{len(images_data)}: {img_filename}", file=sys.stderr)
+                                except Exception as e:
+                                    if verbosity > 0:
+                                        print(f"Failed to download image {img_url}: {e}", file=sys.stderr)
+                        
+                        # Save the mapping of URLs to local files
+                        if downloaded_images:
+                            mapping_file = f"{args.output}.images_mapping.json"
+                            with open(mapping_file, 'w', encoding='utf-8') as f:
+                                json.dump(downloaded_images, f, indent=2)
+                            if verbosity > 0:
+                                print(f"Saved image mapping to {mapping_file}", file=sys.stderr)
+                                
+                except Exception as e:
+                    if verbosity > 0:
+                        print(f"Error processing images: {e}", file=sys.stderr)
+
             # If not --force, skip writing empty files
             if not args.force and (out_str == "" or (isinstance(out_str, str) and out_str.strip() == "")):
                 if verbosity > 1:
@@ -416,13 +595,33 @@ def main():
             else:
                 out_filename = f"{args.output}.{item}{ext}"
 
-            # TODO: Implement overwrite protection (force, skip, interactive modes)
-            try:
-                with open(out_filename, "w", encoding="utf-8") as f_out:
-                    f_out.write(str(out_str))
-            except OSError as e:
+            # Handle existing files
+            if os.path.exists(out_filename) and not args.force:
                 if verbosity > 0:
-                    print(f"Error writing to {out_filename}: {e}", file=sys.stderr)
+                    print(f"Warning: File {out_filename} already exists. Use --force to overwrite.", file=sys.stderr)
+                continue
+            
+            try:
+                # Handle base64 encoded images
+                if item in ["screenshot", "pageshot"] and out_str.startswith("data:image/"):
+                    # Extract base64 data
+                    header, base64_data = out_str.split(",", 1)
+                    image_data = base64.b64decode(base64_data)
+                    with open(out_filename, "wb") as f_out:
+                        f_out.write(image_data)
+                    if verbosity > 0:
+                        print(f"Saved base64 image to {out_filename}", file=sys.stderr)
+                else:
+                    # Regular text content
+                    with open(out_filename, "w", encoding="utf-8") as f_out:
+                        f_out.write(str(out_str))
+                    if verbosity > 0:
+                        print(f"Saved {item} to {out_filename}", file=sys.stderr)
+            except OSError as e:
+                print(f"Error writing to {out_filename}: {e}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"Unexpected error writing {out_filename}: {e}", file=sys.stderr)
                 sys.exit(1)
 
             # Attempt to store extended attribute for the original URL
@@ -456,12 +655,14 @@ def main():
                         return ""
 
             # If no field is specified but we have a return format
-            if normalized_rf == "text":
-                return data.get("data", {}).get("text", "")
-            elif normalized_rf == "markdown":
-                return data.get("data", {}).get("markdown", "")
-            elif normalized_rf == "html":
-                return data.get("data", {}).get("html", "")
+            # Check both direct field and content field
+            if normalized_rf in ["text", "markdown", "html"]:
+                # First try the specific format field
+                value = data.get("data", {}).get(normalized_rf, "")
+                if not value:
+                    # Fall back to content field
+                    value = data.get("data", {}).get("content", "")
+                return value
             elif normalized_rf == "screenshot":
                 return data.get("data", {}).get("screenshot", "")
             elif normalized_rf == "pageshot":
