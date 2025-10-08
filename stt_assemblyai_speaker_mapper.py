@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "instructor>=1.0.0",
+#   "pydantic>=2.0.0",
+#   "openai>=1.0.0",
+# ]
+# requires-python = ">=3.11"
+# ///
 """
 AssemblyAI Speaker Name Mapper
 
