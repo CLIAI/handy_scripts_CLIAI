@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "google-cloud-texttospeech>=2.14.0",
+# ]
+# requires-python = ">=3.11"
+# ///
 
 # Generate dialogue with multiple speakers
 # https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
