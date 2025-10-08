@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "requests>=2.31",
+#   "openai>=1.0",
+#   "ell-ai>=0.0.13",
+# ]
+# requires-python = ">=3.11"
+# ///
 
 # Important Note to Keep:
 # This script imports several libraries in try blocks by design.
