@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "requests>=2.31",
+# ]
+# requires-python = ">=3.11"
+# ///
 import argparse
 import configparser
 import json
