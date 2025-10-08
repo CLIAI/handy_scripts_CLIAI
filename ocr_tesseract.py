@@ -1,4 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "Pillow>=10.0.0",
+#   "opencv-python>=4.8.0",
+#   "pytesseract>=0.3.10",
+#   "numpy>=1.24.0",
+# ]
+# requires-python = ">=3.11"
+# ///
 
 # OCR with Tesseract including enhancing options leverages adaptive and
 # simple thresholding to boost text extraction accuracy; employs
