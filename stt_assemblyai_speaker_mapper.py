@@ -33,7 +33,7 @@ import sys
 import json
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 # Optional LLM detection support
 try:
@@ -173,10 +173,19 @@ def find_transcript_segments(json_obj):
 # ----------------------------------------------------------------------
 
 if INSTRUCTOR_AVAILABLE:
+    class SpeakerMapping(BaseModel):
+        """Individual speaker label to name mapping."""
+        speaker_label: str = Field(
+            description="Speaker label from transcript (e.g., 'A', 'B', 'SPEAKER_00')"
+        )
+        speaker_name: str = Field(
+            description="Identified name or role for this speaker"
+        )
+
     class SpeakerDetection(BaseModel):
         """Pydantic model for LLM speaker detection response."""
-        speakers: Dict[str, str] = Field(
-            description="Mapping of speaker labels to suggested names or roles"
+        speakers: List[SpeakerMapping] = Field(
+            description='List of speaker mappings. Must include one mapping for EACH detected speaker label.'
         )
         confidence: str = Field(
             description="Confidence level: low, medium, or high",
@@ -297,17 +306,22 @@ def detect_speakers_llm(
 
 DETECTED SPEAKERS: {', '.join(detected_labels)}
 
-Based on the conversation content, context clues, and speaking patterns, suggest the most likely names or professional roles for each speaker.
+Your task is to create a mapping of each detected speaker label to their actual name or professional role.
 
 Look for:
 - Direct name mentions (e.g., "Hi Alice", "Thanks Bob")
 - Introductions ("I'm...", "My name is...")
+- Self-references using third person ("Alice is happy", "Bob appreciates")
 - Professional roles if names aren't mentioned (Host, Guest, Expert, Interviewer)
 
 TRANSCRIPT SAMPLE:
 {transcript_sample}
 
-Provide your best suggestions for each speaker. Use "Unknown" if you cannot determine identity with reasonable confidence.
+You must provide a mapping for EACH detected speaker label ({', '.join(detected_labels)}) to their identified name or role.
+Use "Unknown" only if you cannot determine identity with reasonable confidence.
+
+Example output format:
+- If detected speakers are ["A", "B"], you should return: {{"A": "Alice Anderson", "B": "Bob Martinez"}}
 """
 
     try:
@@ -324,8 +338,9 @@ Provide your best suggestions for each speaker. Use "Unknown" if you cannot dete
         else:
             # Standard provider
             log_info(args, f"Using provider: {provider_model}")
-            client = instructor.from_provider(provider_model)
-            model = None  # Instructor auto-extracts from provider_model
+            client = instructor.from_provider(provider_model, mode=instructor.Mode.TOOLS)
+            # Extract model name from provider_model (e.g., "openai/gpt-4o-mini" -> "gpt-4o-mini")
+            model = provider_model.split("/")[1] if "/" in provider_model else provider_model
 
         # Call LLM with structured output
         log_debug(args, "Calling LLM...")
@@ -339,6 +354,9 @@ Provide your best suggestions for each speaker. Use "Unknown" if you cannot dete
         log_debug(args, f"LLM response - Confidence: {result.confidence}")
         log_debug(args, f"LLM response - Speakers: {result.speakers}")
         log_debug(args, f"LLM response - Reasoning: {result.reasoning}")
+
+        # Convert List[SpeakerMapping] back to Dict[str, str] for compatibility
+        result.speakers = {mapping.speaker_label: mapping.speaker_name for mapping in result.speakers}
 
         return result
 
