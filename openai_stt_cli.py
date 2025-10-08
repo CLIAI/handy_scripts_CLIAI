@@ -1,4 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "numpy>=1.24",
+#   "soundfile>=0.12",
+#   "sounddevice>=0.4",
+#   "prompt_toolkit>=3.0",
+#   "openai>=1.0",
+# ]
+# requires-python = ">=3.11"
+# ///
 import os
 import queue
 import tempfile
