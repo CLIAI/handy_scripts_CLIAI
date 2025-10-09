@@ -49,6 +49,106 @@ except ImportError:
     OpenAI = None
 
 # ----------------------------------------------------------------------
+# Model Shortcuts - Map common names to full provider/model strings
+# ----------------------------------------------------------------------
+MODEL_SHORTCUTS = {
+    # OpenAI models (best structured output support)
+    '4o-mini': 'openai/gpt-4o-mini',
+    'gpt-4o-mini': 'openai/gpt-4o-mini',
+    '4o': 'openai/gpt-4o',
+    'gpt-4o': 'openai/gpt-4o',
+    '4.1': 'openai/gpt-4.1',
+    'gpt-4.1': 'openai/gpt-4.1',
+    '4.1-mini': 'openai/gpt-4.1-mini',
+    'gpt-4.1-mini': 'openai/gpt-4.1-mini',
+    '4.1-nano': 'openai/gpt-4.1-nano',
+    'gpt-4.1-nano': 'openai/gpt-4.1-nano',
+    'o1': 'openai/o1',
+    'o3-mini': 'openai/o3-mini',
+
+    # Anthropic Claude (best accuracy for speaker detection)
+    'sonnet': 'anthropic/claude-sonnet-4-5',
+    'claude-sonnet': 'anthropic/claude-sonnet-4-5',
+    'sonnet-4-5': 'anthropic/claude-sonnet-4-5',
+    'claude-sonnet-4-5': 'anthropic/claude-sonnet-4-5',
+    'opus': 'anthropic/claude-opus-4-1',
+    'claude-opus': 'anthropic/claude-opus-4-1',
+    'opus-4-1': 'anthropic/claude-opus-4-1',
+    'claude-opus-4-1': 'anthropic/claude-opus-4-1',
+    'haiku': 'anthropic/claude-3-5-haiku',
+    'claude-haiku': 'anthropic/claude-3-5-haiku',
+    'haiku-3-5': 'anthropic/claude-3-5-haiku',
+    'claude-3-5-haiku': 'anthropic/claude-3-5-haiku',
+    'sonnet-3-7': 'anthropic/claude-3-7-sonnet',
+    'claude-3-7-sonnet': 'anthropic/claude-3-7-sonnet',
+
+    # Google Gemini (cost leader)
+    'gemini': 'google/gemini-2.5-flash',
+    'gemini-flash': 'google/gemini-2.5-flash',
+    'gemini-2.5': 'google/gemini-2.5-flash',
+    'gemini-2.5-flash': 'google/gemini-2.5-flash',
+    'gemini-2.0': 'google/gemini-2.0-flash',
+    'gemini-2.0-flash': 'google/gemini-2.0-flash',
+    'gemini-pro': 'google/gemini-2.0-pro-experimental',
+    'gemini-2.0-pro': 'google/gemini-2.0-pro-experimental',
+
+    # Groq (ultra-fast inference)
+    'llama': 'groq/llama-3.3-70b-versatile',
+    'llama3.3': 'groq/llama-3.3-70b-versatile',
+    'llama-3.3': 'groq/llama-3.3-70b-versatile',
+    'llama3.2': 'groq/llama-3.2-3b-preview',
+    'llama-3.2': 'groq/llama-3.2-3b-preview',
+    'llama3.1': 'groq/llama-3.1-8b-instant',
+    'llama-3.1': 'groq/llama-3.1-8b-instant',
+
+    # DeepSeek (cost effective with caching)
+    'deepseek': 'deepseek/deepseek-v3.2-exp',
+    'deepseek-v3': 'deepseek/deepseek-v3.2-exp',
+    'deepseek-v3.2': 'deepseek/deepseek-v3.2-exp',
+    'deepseek-r1': 'deepseek/deepseek-r1',
+
+    # Mistral
+    'mistral': 'mistral/mistral-large-latest',
+    'mistral-large': 'mistral/mistral-large-latest',
+    'mistral-medium': 'mistral/mistral-medium-3',
+    'mistral-small': 'mistral/mistral-small',
+    'codestral': 'mistral/codestral',
+
+    # Ollama (local deployment)
+    'ollama': 'ollama/llama3.2',
+    'ollama-llama': 'ollama/llama3.2',
+    'ollama-mistral': 'ollama/mistral',
+}
+
+
+def resolve_model_shortcut(model_string: str) -> str:
+    """
+    Resolve model shortcut to full provider/model string.
+
+    Args:
+        model_string: Model name or shortcut (e.g., "4o-mini", "sonnet", "openai/gpt-4o")
+
+    Returns:
+        Full provider/model string (e.g., "openai/gpt-4o-mini")
+
+    Examples:
+        >>> resolve_model_shortcut("4o-mini")
+        'openai/gpt-4o-mini'
+        >>> resolve_model_shortcut("sonnet")
+        'anthropic/claude-sonnet-4-5'
+        >>> resolve_model_shortcut("openai/gpt-4o")
+        'openai/gpt-4o'
+    """
+    # If already in provider/model format, return as-is
+    if '/' in model_string:
+        return model_string
+
+    # Case-insensitive lookup
+    model_lower = model_string.lower()
+    return MODEL_SHORTCUTS.get(model_lower, model_string)
+
+
+# ----------------------------------------------------------------------
 # Verbosity-aware logger (matches stt_assemblyai.py pattern)
 # ----------------------------------------------------------------------
 def _should_log(args, level_threshold):
@@ -280,7 +380,7 @@ def detect_speakers_llm(
     Detect speaker names using LLM via Instructor.
 
     Args:
-        provider_model: Provider and model string (e.g., "openai/gpt-4o-mini")
+        provider_model: Provider and model string or shortcut (e.g., "4o-mini", "sonnet", "openai/gpt-4o-mini")
         transcript_sample: Sample of transcript text
         detected_labels: List of detected speaker labels (e.g., ['A', 'B'])
         endpoint: Optional custom endpoint URL
@@ -297,6 +397,13 @@ def detect_speakers_llm(
         raise RuntimeError(
             "Instructor library not available. Install with: pip install instructor openai"
         )
+
+    # Resolve model shortcuts to full provider/model strings
+    original_model = provider_model
+    provider_model = resolve_model_shortcut(provider_model)
+
+    if original_model != provider_model:
+        log_debug(args, f"Resolved shortcut '{original_model}' → '{provider_model}'")
 
     log_debug(args, f"LLM provider: {provider_model}")
     log_debug(args, f"Detected labels: {detected_labels}")
@@ -733,6 +840,26 @@ LLM Providers (requires: pip install instructor openai):
   groq/MODEL          - Groq (llama-3.1-70b-versatile, etc.)
   ollama/MODEL        - Local Ollama (llama3.2, mistral, etc.)
   Custom endpoint:    --llm-detect ollama/llama3.2 --llm-endpoint http://server:11434
+
+Model Shortcuts (can use these instead of full provider/model):
+  OpenAI:      4o-mini, gpt-4o-mini → openai/gpt-4o-mini (recommended for cost)
+               4o, gpt-4o → openai/gpt-4o
+               4.1, gpt-4.1 → openai/gpt-4.1
+               o1 → openai/o1 (reasoning model)
+  Anthropic:   sonnet, claude-sonnet → anthropic/claude-sonnet-4-5 (best accuracy)
+               opus, claude-opus → anthropic/claude-opus-4-1
+               haiku, claude-haiku → anthropic/claude-3-5-haiku
+  Google:      gemini, gemini-flash → google/gemini-2.5-flash (cost leader)
+               gemini-pro → google/gemini-2.0-pro-experimental
+  Groq:        llama, llama3.3 → groq/llama-3.3-70b-versatile (ultra-fast)
+               llama3.2 → groq/llama-3.2-3b-preview
+  DeepSeek:    deepseek → deepseek/deepseek-v3.2-exp (cost effective)
+  Ollama:      ollama → ollama/llama3.2 (local)
+
+Shortcut Examples:
+  %(prog)s --llm-detect 4o-mini audio.assemblyai.json
+  %(prog)s --llm-detect sonnet audio.assemblyai.json
+  %(prog)s --llm-detect gemini audio.assemblyai.json
         """
     )
 
