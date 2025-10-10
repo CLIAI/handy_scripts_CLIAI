@@ -103,10 +103,15 @@ AI suggests names, you confirm or override:
 **Interaction:**
 
 ```
-=== Speaker Mapping (AI-Assisted) ===
-Speaker A [Alice Anderson]: _          ← Press Enter to accept
-Speaker B [Bob Smith]: Robert          ← Type to override
-Speaker C [Unknown]: Charlie Chaplin   ← AI unsure, provide name
+=== AI-Detected Speaker Mappings ===
+A => Alice Anderson
+B => Bob Smith
+C => Unknown
+
+=== Review and Confirm (press Enter to accept, or type to override) ===
+A => [Alice Anderson]: _               ← Press Enter to accept
+B => [Bob Smith]: Robert               ← Type to override
+C => [Unknown]: Charlie Chaplin        ← AI unsure, provide name
 ```
 
 #### 3. Fallback Mode
@@ -203,9 +208,15 @@ cat audio.mp3.mapped.txt
 ```bash
 # Step 2 alternative: AI suggests, you confirm/override
 ./stt_assemblyai_speaker_mapper.py --llm-interactive openai/gpt-4o-mini audio.mp3.assemblyai.json
-# Prompts:
-# Speaker A [Alice Anderson]: ← Press Enter to accept
-# Speaker B [Bob Smith]: ← Press Enter to accept
+
+# Shows:
+# === AI-Detected Speaker Mappings ===
+# A => Alice Anderson
+# B => Bob Smith
+#
+# === Review and Confirm (press Enter to accept, or type to override) ===
+# A => [Alice Anderson]: ← Press Enter to accept
+# B => [Bob Smith]: ← Press Enter to accept
 ```
 
 ### Option 2: Manual Mapping (Traditional)

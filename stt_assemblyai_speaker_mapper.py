@@ -114,10 +114,59 @@ MODEL_SHORTCUTS = {
     'mistral-small': 'mistral/mistral-small',
     'codestral': 'mistral/codestral',
 
-    # Ollama (local deployment)
+    # Ollama (local deployment) - Small CPU-optimized models
     'ollama': 'ollama/llama3.2',
     'ollama-llama': 'ollama/llama3.2',
     'ollama-mistral': 'ollama/mistral',
+
+    # SmolLM2 series (best small models for CPU, 16GB RAM friendly)
+    'smollm2': 'ollama/smollm2:1.7b',
+    'smollm2:1.7b': 'ollama/smollm2:1.7b',
+    'smollm2-1.7b': 'ollama/smollm2:1.7b',
+    'smollm2:360m': 'ollama/smollm2:360m',
+    'smollm2-360m': 'ollama/smollm2:360m',
+    'smollm2:135m': 'ollama/smollm2:135m',
+    'smollm2-135m': 'ollama/smollm2:135m',
+
+    # Qwen2.5 small variants (excellent small coders)
+    'qwen2.5:0.5b': 'ollama/qwen2.5:0.5b',
+    'qwen2.5-0.5b': 'ollama/qwen2.5:0.5b',
+    'qwen2.5:1.5b': 'ollama/qwen2.5:1.5b',
+    'qwen2.5-1.5b': 'ollama/qwen2.5:1.5b',
+    'qwen2.5:3b': 'ollama/qwen2.5:3b',
+    'qwen2.5-3b': 'ollama/qwen2.5:3b',
+    'qwen2.5-coder:0.5b': 'ollama/qwen2.5-coder:0.5b',
+    'qwen2.5-coder-0.5b': 'ollama/qwen2.5-coder:0.5b',
+    'qwen2.5-coder:1.5b': 'ollama/qwen2.5-coder:1.5b',
+    'qwen2.5-coder-1.5b': 'ollama/qwen2.5-coder:1.5b',
+    'qwen2.5-coder:3b': 'ollama/qwen2.5-coder:3b',
+    'qwen2.5-coder-3b': 'ollama/qwen2.5-coder:3b',
+
+    # Llama 3.2 small variants (fast on CPU)
+    'llama3.2:1b': 'ollama/llama3.2:1b',
+    'llama3.2-1b': 'ollama/llama3.2:1b',
+    'llama3.2:3b': 'ollama/llama3.2:3b',
+    'llama3.2-3b': 'ollama/llama3.2:3b',
+
+    # Phi models (punches above weight)
+    'phi3': 'ollama/phi3:mini',
+    'phi3:mini': 'ollama/phi3:mini',
+    'phi3-mini': 'ollama/phi3:mini',
+    'phi3:3.8b': 'ollama/phi3:3.8b',
+    'phi4': 'ollama/phi4:14b',
+
+    # DeepSeek Coder (coding specialist)
+    'deepseek-coder': 'ollama/deepseek-coder:1.3b',
+    'deepseek-coder:1.3b': 'ollama/deepseek-coder:1.3b',
+    'deepseek-coder-1.3b': 'ollama/deepseek-coder:1.3b',
+
+    # Other popular small models
+    'tinyllama': 'ollama/tinyllama:1.1b',
+    'tinyllama:1.1b': 'ollama/tinyllama:1.1b',
+    'stablelm-zephyr': 'ollama/stablelm-zephyr:3b',
+    'stablelm-zephyr:3b': 'ollama/stablelm-zephyr:3b',
+    'orca-mini': 'ollama/orca-mini:3b',
+    'orca-mini:3b': 'ollama/orca-mini:3b',
 }
 
 
@@ -565,7 +614,14 @@ def prompt_interactive_with_suggestions(
     Returns:
         Final speaker mapping dict
     """
-    print("\n=== Speaker Mapping (AI-Assisted) ===", file=sys.stderr)
+    # First, show ALL AI-detected mappings upfront for context
+    print("\n=== AI-Detected Speaker Mappings ===", file=sys.stderr)
+    for speaker in sorted(detected_speakers):
+        suggestion = ai_suggestions.get(speaker, "Unknown")
+        print(f"{speaker} => {suggestion}", file=sys.stderr)
+
+    # Then prompt for confirmation/override
+    print("\n=== Review and Confirm (press Enter to accept, or type to override) ===", file=sys.stderr)
 
     speaker_map = {}
 
@@ -573,8 +629,8 @@ def prompt_interactive_with_suggestions(
         # Get AI suggestion
         suggestion = ai_suggestions.get(speaker, "Unknown")
 
-        # Prompt with suggestion as default
-        prompt_text = f"Speaker {speaker} [{suggestion}]: "
+        # Prompt with format: "A => [Alice Anderson]: "
+        prompt_text = f"{speaker} => [{suggestion}]: "
         user_input = input(prompt_text).strip()
 
         if user_input:
@@ -854,12 +910,26 @@ Model Shortcuts (can use these instead of full provider/model):
   Groq:        llama, llama3.3 → groq/llama-3.3-70b-versatile (ultra-fast)
                llama3.2 → groq/llama-3.2-3b-preview
   DeepSeek:    deepseek → deepseek/deepseek-v3.2-exp (cost effective)
-  Ollama:      ollama → ollama/llama3.2 (local)
+
+Ollama Small Models (CPU-optimized for 16GB+ RAM):
+  Best Overall: smollm2, smollm2:1.7b → ollama/smollm2:1.7b (~1.5GB, 20-30 t/s)
+  Ultra-Fast:   smollm2:360m → ollama/smollm2:360m (~0.5GB, 40-80 t/s)
+                smollm2:135m → ollama/smollm2:135m (~0.3GB, 50-100+ t/s)
+  Best Coder:   qwen2.5-coder:1.5b → ollama/qwen2.5-coder:1.5b (~1.2GB)
+                qwen2.5-coder:3b → ollama/qwen2.5-coder:3b (~2.5GB)
+  Fast Chat:    llama3.2:1b → ollama/llama3.2:1b (~0.9GB, 200-300 t/s)
+                llama3.2:3b → ollama/llama3.2:3b (~2.3GB, 15-25 t/s)
+  Specialized:  phi3, phi3:mini → ollama/phi3:mini (~2.4GB, punches above weight)
+                deepseek-coder:1.3b → ollama/deepseek-coder:1.3b (~1GB, coding)
+                tinyllama:1.1b → ollama/tinyllama:1.1b (~0.9GB, IoT-capable)
 
 Shortcut Examples:
   %(prog)s --llm-detect 4o-mini audio.assemblyai.json
   %(prog)s --llm-detect sonnet audio.assemblyai.json
   %(prog)s --llm-detect gemini audio.assemblyai.json
+  %(prog)s --llm-detect smollm2:1.7b audio.assemblyai.json       # Best small model
+  %(prog)s --llm-detect qwen2.5-coder:1.5b audio.assemblyai.json # Best small coder
+  %(prog)s --llm-detect llama3.2:1b audio.assemblyai.json        # Ultra-fast local
         """
     )
 
