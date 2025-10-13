@@ -1,0 +1,53 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Hey there! I'm Michael Thompson, but everyone calls me Mike.",
+      "start": 0,
+      "end": 3500
+    },
+    {
+      "speaker": "B",
+      "text": "Nice to meet you, Mike! I'm Elizabeth Wilson. Most people call me Beth.",
+      "start": 3600,
+      "end": 7500
+    },
+    {
+      "speaker": "A",
+      "text": "Great to meet you too, Beth. So what brings you here today?",
+      "start": 7600,
+      "end": 10500
+    },
+    {
+      "speaker": "B",
+      "text": "Well, Mike, I wanted to discuss the new project we're starting.",
+      "start": 10600,
+      "end": 14000
+    },
+    {
+      "speaker": "A",
+      "text": "Beth, that sounds interesting. Mike here is always excited about new projects!",
+      "start": 14100,
+      "end": 18500
+    },
+    {
+      "speaker": "B",
+      "text": "I can see that, Mike! Elizabeth is pretty excited about it too.",
+      "start": 18600,
+      "end": 22000
+    },
+    {
+      "speaker": "A",
+      "text": "Michael thinks this could be a game-changer, Beth.",
+      "start": 22100,
+      "end": 25000
+    },
+    {
+      "speaker": "B",
+      "text": "I agree, Mike. Let's make it happen!",
+      "start": 25100,
+      "end": 27500
+    }
+  ],
+  "audio_duration": 27500
+}

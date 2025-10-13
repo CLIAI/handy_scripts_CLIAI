@@ -1,0 +1,21 @@
+{
+  "test_id": "006-ambiguous-context",
+  "description": "Ambiguous context - difficult to determine speakers",
+  "expected_mappings": {
+    "A": {
+      "acceptable": ["Unknown", "Speaker A", "Person A", "A", "Chris Taylor", "Chris Morgan", "Chris"],
+      "preferred": "Unknown"
+    },
+    "B": {
+      "acceptable": ["Unknown", "Speaker B", "Person B", "B", "Chris Taylor", "Chris Morgan", "Chris"],
+      "preferred": "Unknown"
+    }
+  },
+  "scoring": {
+    "exact_preferred": 1.0,
+    "acceptable_variant": 1.0,
+    "partial_match": 0.3,
+    "wrong": 0.0
+  },
+  "notes": "This test is intentionally ambiguous. Any reasonable answer should be accepted."
+}

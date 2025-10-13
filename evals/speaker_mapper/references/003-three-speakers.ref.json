@@ -1,0 +1,24 @@
+{
+  "test_id": "003-three-speakers",
+  "description": "Three-way conversation with clear names",
+  "expected_mappings": {
+    "A": {
+      "acceptable": ["Jennifer Martinez", "Jennifer", "Martinez"],
+      "preferred": "Jennifer Martinez"
+    },
+    "B": {
+      "acceptable": ["Robert Chen", "Robert", "Chen", "Bob Chen", "Bob"],
+      "preferred": "Robert Chen"
+    },
+    "C": {
+      "acceptable": ["Amy Parker", "Amy", "Parker"],
+      "preferred": "Amy Parker"
+    }
+  },
+  "scoring": {
+    "exact_preferred": 1.0,
+    "acceptable_variant": 1.0,
+    "partial_match": 0.5,
+    "wrong": 0.0
+  }
+}

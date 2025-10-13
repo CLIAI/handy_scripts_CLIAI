@@ -1,0 +1,20 @@
+{
+  "test_id": "002-informal-names",
+  "description": "Handles Mike/Michael, Beth/Elizabeth variations",
+  "expected_mappings": {
+    "A": {
+      "acceptable": ["Michael", "Mike", "Michael Thompson", "Mike Thompson", "Thompson"],
+      "preferred": "Michael"
+    },
+    "B": {
+      "acceptable": ["Elizabeth", "Beth", "Elizabeth Wilson", "Beth Wilson", "Wilson", "Liz"],
+      "preferred": "Elizabeth"
+    }
+  },
+  "scoring": {
+    "exact_preferred": 1.0,
+    "acceptable_variant": 1.0,
+    "partial_match": 0.5,
+    "wrong": 0.0
+  }
+}

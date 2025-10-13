@@ -1010,6 +1010,11 @@ Shortcut Examples:
         action='store_true',
         help='Only show detected speakers and exit (no processing)'
     )
+    parser.add_argument(
+        '--stdout-only',
+        action='store_true',
+        help='Output speaker mapping as JSON to stdout instead of files (for benchmarking)'
+    )
 
     # Logging
     parser.add_argument(
@@ -1089,6 +1094,15 @@ def main():
     # Apply mapping
     log_debug(args, "Applying speaker mapping to JSON...")
     mapped_json = replace_speakers_recursive(json_data, speaker_map)
+
+    # Stdout-only mode (for benchmarking)
+    if args.stdout_only:
+        output = {
+            "mappings": speaker_map,
+            "detected_speakers": sorted(detected_speakers),
+        }
+        print(json.dumps(output, indent=2))
+        return
 
     # Determine output paths
     if args.output:

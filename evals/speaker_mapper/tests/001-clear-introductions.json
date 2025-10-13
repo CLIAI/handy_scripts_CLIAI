@@ -1,0 +1,41 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Hello everyone! I'm Sarah Johnson, and I'll be your host today.",
+      "start": 0,
+      "end": 3500
+    },
+    {
+      "speaker": "B",
+      "text": "Hi Sarah! My name is David Lee. Thanks for having me on the show.",
+      "start": 3600,
+      "end": 7000
+    },
+    {
+      "speaker": "A",
+      "text": "It's great to have you here, David. Let's start with your background.",
+      "start": 7100,
+      "end": 10500
+    },
+    {
+      "speaker": "B",
+      "text": "Sure, Sarah. I've been working in software engineering for about ten years now.",
+      "start": 10600,
+      "end": 15000
+    },
+    {
+      "speaker": "A",
+      "text": "That's impressive, David. What got you interested in this field?",
+      "start": 15100,
+      "end": 18500
+    },
+    {
+      "speaker": "B",
+      "text": "Well, Sarah, I've always been fascinated by technology and problem-solving.",
+      "start": 18600,
+      "end": 23000
+    }
+  ],
+  "audio_duration": 23000
+}

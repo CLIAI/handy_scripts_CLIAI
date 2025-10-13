@@ -1,0 +1,53 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Hi, I'm Jessica. I work in the marketing department.",
+      "start": 0,
+      "end": 3500
+    },
+    {
+      "speaker": "B",
+      "text": "Nice to meet you, Jessica. I'm Thompson from engineering.",
+      "start": 3600,
+      "end": 7000
+    },
+    {
+      "speaker": "A",
+      "text": "Great to meet you, Thompson. How long have you been with the company?",
+      "start": 7100,
+      "end": 10500
+    },
+    {
+      "speaker": "B",
+      "text": "About three years now, Jessica. What about you?",
+      "start": 10600,
+      "end": 13500
+    },
+    {
+      "speaker": "A",
+      "text": "Just started last month! Thompson, can you tell me about your current project?",
+      "start": 13600,
+      "end": 17500
+    },
+    {
+      "speaker": "B",
+      "text": "Sure, Jessica. We're working on a new mobile app for our customers.",
+      "start": 17600,
+      "end": 21000
+    },
+    {
+      "speaker": "A",
+      "text": "That sounds exciting, Thompson! I'd love to help with the marketing campaign.",
+      "start": 21100,
+      "end": 25000
+    },
+    {
+      "speaker": "B",
+      "text": "That would be great, Jessica. Let's set up a meeting next week.",
+      "start": 25100,
+      "end": 28500
+    }
+  ],
+  "audio_duration": 28500
+}

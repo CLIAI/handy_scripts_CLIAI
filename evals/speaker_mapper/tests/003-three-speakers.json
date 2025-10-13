@@ -1,0 +1,59 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Good morning everyone. I'm Jennifer Martinez, the project lead.",
+      "start": 0,
+      "end": 3800
+    },
+    {
+      "speaker": "B",
+      "text": "Hi Jennifer! I'm Robert Chen, the backend developer on this project.",
+      "start": 3900,
+      "end": 7500
+    },
+    {
+      "speaker": "C",
+      "text": "And I'm Amy Parker, handling the frontend work. Nice to meet you both!",
+      "start": 7600,
+      "end": 11500
+    },
+    {
+      "speaker": "A",
+      "text": "Great! So, Robert, can you tell us about the API architecture?",
+      "start": 11600,
+      "end": 15000
+    },
+    {
+      "speaker": "B",
+      "text": "Sure, Jennifer. I've designed it with scalability in mind. Amy will be consuming these APIs.",
+      "start": 15100,
+      "end": 20000
+    },
+    {
+      "speaker": "C",
+      "text": "That's perfect, Robert! Jennifer, when do you think we can start integration?",
+      "start": 20100,
+      "end": 24000
+    },
+    {
+      "speaker": "A",
+      "text": "Amy, we should be ready next week. Robert, can you have the docs ready by then?",
+      "start": 24100,
+      "end": 28500
+    },
+    {
+      "speaker": "B",
+      "text": "Absolutely, Jennifer. I'll send them to Amy by Wednesday.",
+      "start": 28600,
+      "end": 32000
+    },
+    {
+      "speaker": "C",
+      "text": "Thanks, Robert! Jennifer, I'll keep you posted on the progress.",
+      "start": 32100,
+      "end": 35500
+    }
+  ],
+  "audio_duration": 35500
+}

@@ -1,0 +1,20 @@
+{
+  "test_id": "004-no-names-mentioned",
+  "description": "No names mentioned - should return Unknown or generic labels",
+  "expected_mappings": {
+    "A": {
+      "acceptable": ["Unknown", "Speaker A", "Host", "Interviewer", "Person A", "A"],
+      "preferred": "Unknown"
+    },
+    "B": {
+      "acceptable": ["Unknown", "Speaker B", "Guest", "Participant", "Person B", "B"],
+      "preferred": "Unknown"
+    }
+  },
+  "scoring": {
+    "exact_preferred": 1.0,
+    "acceptable_variant": 1.0,
+    "partial_match": 0.3,
+    "wrong": 0.0
+  }
+}

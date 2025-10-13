@@ -1,0 +1,53 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Someone mentioned that Chris would be joining us today.",
+      "start": 0,
+      "end": 3000
+    },
+    {
+      "speaker": "B",
+      "text": "Yes, I heard that too. Is that Chris Taylor or Chris Morgan?",
+      "start": 3100,
+      "end": 6500
+    },
+    {
+      "speaker": "A",
+      "text": "I'm not sure. The email wasn't very clear about which one.",
+      "start": 6600,
+      "end": 9500
+    },
+    {
+      "speaker": "B",
+      "text": "Well, one of them should arrive soon. Let's wait and see.",
+      "start": 9600,
+      "end": 13000
+    },
+    {
+      "speaker": "A",
+      "text": "In the meantime, should we review the agenda?",
+      "start": 13100,
+      "end": 15500
+    },
+    {
+      "speaker": "B",
+      "text": "Good idea. We have a lot to cover today regardless of who shows up.",
+      "start": 15600,
+      "end": 19000
+    },
+    {
+      "speaker": "A",
+      "text": "Right. Let's make sure we're prepared for either scenario.",
+      "start": 19100,
+      "end": 22000
+    },
+    {
+      "speaker": "B",
+      "text": "Agreed. The presentation needs to be finalized by end of day anyway.",
+      "start": 22100,
+      "end": 25500
+    }
+  ],
+  "audio_duration": 25500
+}

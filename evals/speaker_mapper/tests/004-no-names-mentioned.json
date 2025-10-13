@@ -1,0 +1,53 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Hello, welcome to our discussion today.",
+      "start": 0,
+      "end": 2500
+    },
+    {
+      "speaker": "B",
+      "text": "Thank you for having me. It's great to be here.",
+      "start": 2600,
+      "end": 5500
+    },
+    {
+      "speaker": "A",
+      "text": "Let's talk about the recent developments in the industry.",
+      "start": 5600,
+      "end": 8500
+    },
+    {
+      "speaker": "B",
+      "text": "Yes, there have been some interesting changes lately.",
+      "start": 8600,
+      "end": 11500
+    },
+    {
+      "speaker": "A",
+      "text": "What's your perspective on the new regulations?",
+      "start": 11600,
+      "end": 14000
+    },
+    {
+      "speaker": "B",
+      "text": "I think they're necessary, though implementation will be challenging.",
+      "start": 14100,
+      "end": 17500
+    },
+    {
+      "speaker": "A",
+      "text": "That's a fair assessment. We'll need to adapt our strategies accordingly.",
+      "start": 17600,
+      "end": 21000
+    },
+    {
+      "speaker": "B",
+      "text": "Agreed. The transition period will be crucial for everyone involved.",
+      "start": 21100,
+      "end": 24500
+    }
+  ],
+  "audio_duration": 24500
+}

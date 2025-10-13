@@ -1,0 +1,77 @@
+{
+  "utterances": [
+    {
+      "speaker": "A",
+      "text": "Welcome everyone! I'm Dr. Patricia Williams, and I'll be moderating this panel.",
+      "start": 0,
+      "end": 4500
+    },
+    {
+      "speaker": "B",
+      "text": "Thank you, Dr. Williams. I'm James Rodriguez, CEO of TechCorp.",
+      "start": 4600,
+      "end": 8500
+    },
+    {
+      "speaker": "C",
+      "text": "Hi everyone! I'm Maria Santos, the CTO at InnovateNow.",
+      "start": 8600,
+      "end": 12000
+    },
+    {
+      "speaker": "D",
+      "text": "And I'm Kevin O'Brien, representing the investor community here.",
+      "start": 12100,
+      "end": 15500
+    },
+    {
+      "speaker": "A",
+      "text": "Great! James, let's start with you. What's your vision for the industry?",
+      "start": 15600,
+      "end": 19500
+    },
+    {
+      "speaker": "B",
+      "text": "Thanks, Patricia. I believe we're at a turning point. Maria, what do you think?",
+      "start": 19600,
+      "end": 24000
+    },
+    {
+      "speaker": "C",
+      "text": "I agree, James. Kevin, from an investment perspective, are you seeing similar trends?",
+      "start": 24100,
+      "end": 29000
+    },
+    {
+      "speaker": "D",
+      "text": "Absolutely, Maria. Dr. Williams, we're seeing unprecedented interest in this space.",
+      "start": 29100,
+      "end": 33500
+    },
+    {
+      "speaker": "A",
+      "text": "That's fascinating, Kevin. James, how is TechCorp responding to these changes?",
+      "start": 33600,
+      "end": 38000
+    },
+    {
+      "speaker": "B",
+      "text": "Well, Patricia, we're investing heavily in R&D. Maria's company is doing similar things.",
+      "start": 38100,
+      "end": 43000
+    },
+    {
+      "speaker": "C",
+      "text": "Yes, James. Kevin, are investors ready to support this level of innovation?",
+      "start": 43100,
+      "end": 47500
+    },
+    {
+      "speaker": "D",
+      "text": "We are, Maria. In fact, Patricia, I'd say this is the most exciting time to be in tech.",
+      "start": 47600,
+      "end": 52000
+    }
+  ],
+  "audio_duration": 52000
+}

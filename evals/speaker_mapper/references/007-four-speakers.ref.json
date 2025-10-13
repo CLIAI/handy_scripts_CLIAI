@@ -1,0 +1,28 @@
+{
+  "test_id": "007-four-speakers",
+  "description": "Four speakers with clear professional titles",
+  "expected_mappings": {
+    "A": {
+      "acceptable": ["Patricia Williams", "Dr. Patricia Williams", "Dr. Williams", "Patricia", "Williams"],
+      "preferred": "Dr. Patricia Williams"
+    },
+    "B": {
+      "acceptable": ["James Rodriguez", "James", "Rodriguez"],
+      "preferred": "James Rodriguez"
+    },
+    "C": {
+      "acceptable": ["Maria Santos", "Maria", "Santos"],
+      "preferred": "Maria Santos"
+    },
+    "D": {
+      "acceptable": ["Kevin O'Brien", "Kevin", "O'Brien", "Kevin OBrien"],
+      "preferred": "Kevin O'Brien"
+    }
+  },
+  "scoring": {
+    "exact_preferred": 1.0,
+    "acceptable_variant": 1.0,
+    "partial_match": 0.5,
+    "wrong": 0.0
+  }
+}

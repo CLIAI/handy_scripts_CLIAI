@@ -1,0 +1,20 @@
+{
+  "test_id": "005-partial-names",
+  "description": "Only first name or last name mentioned",
+  "expected_mappings": {
+    "A": {
+      "acceptable": ["Jessica", "Jess"],
+      "preferred": "Jessica"
+    },
+    "B": {
+      "acceptable": ["Thompson", "Mr. Thompson", "Thompson (Engineering)"],
+      "preferred": "Thompson"
+    }
+  },
+  "scoring": {
+    "exact_preferred": 1.0,
+    "acceptable_variant": 1.0,
+    "partial_match": 0.5,
+    "wrong": 0.0
+  }
+}
