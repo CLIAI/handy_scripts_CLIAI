@@ -231,25 +231,39 @@ class BenchmarkRunner:
         }
 
 
-def output_jsonl(results: List[Dict], summary: Dict):
+def output_jsonl(results: List[Dict], summary: Dict, file_path: Optional[str] = None):
     """Output results in JSONL format."""
+    lines = []
     for result in results:
-        print(json.dumps(result))
-    print(json.dumps({"summary": summary}))
+        lines.append(json.dumps(result))
+    lines.append(json.dumps({"summary": summary}))
+
+    output_text = '\n'.join(lines) + '\n'
+
+    if file_path:
+        # Write to file
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w') as f:
+            f.write(output_text)
+    else:
+        # Write to stdout
+        print(output_text, end='')
 
 
-def output_ascii(results: List[Dict], summary: Dict, llm_args: List[str]):
+def output_ascii(results: List[Dict], summary: Dict, llm_args: List[str], file_path: Optional[str] = None):
     """Output results in human-readable ASCII table format."""
+    lines = []
+
     # Header
-    print("╔══════════════════════════════════════════════════════════════════════════╗")
-    print("║           Speaker Mapper Benchmark Results                              ║")
-    print(f"║  LLM Args: {' '.join(llm_args):<58}║")
-    print("╚══════════════════════════════════════════════════════════════════════════╝")
-    print()
+    lines.append("╔══════════════════════════════════════════════════════════════════════════╗")
+    lines.append("║           Speaker Mapper Benchmark Results                              ║")
+    lines.append(f"║  LLM Args: {' '.join(llm_args):<58}║")
+    lines.append("╚══════════════════════════════════════════════════════════════════════════╝")
+    lines.append("")
 
     # Results table
-    print("TEST                         STATUS    ACCURACY  TIME    DETAILS")
-    print("────────────────────────────────────────────────────────────────────────────")
+    lines.append("TEST                         STATUS    ACCURACY  TIME    DETAILS")
+    lines.append("────────────────────────────────────────────────────────────────────────────")
 
     for result in results:
         test = result.get("test", "")
@@ -278,23 +292,55 @@ def output_ascii(results: List[Dict], summary: Dict, llm_args: List[str]):
         if status == "error":
             details_str = result.get("error", "Unknown error")[:40]
 
-        print(f"{test:<28} {status_str:<9} {accuracy:>5.1f}%  {time_sec:>5.1f}s  {details_str}")
+        lines.append(f"{test:<28} {status_str:<9} {accuracy:>5.1f}%  {time_sec:>5.1f}s  {details_str}")
 
-    print("────────────────────────────────────────────────────────────────────────────")
-    print()
+    lines.append("────────────────────────────────────────────────────────────────────────────")
+    lines.append("")
 
     # Summary
-    print("SUMMARY")
-    print("════════════════════════════════════════════════════════════════════════════")
-    print(f"  Total Tests:      {summary['total']}")
-    print(f"  Passed:           {summary['passed']} ({summary['pass_rate']*100:.1f}%)")
-    print(f"  Failed:           {summary['failed']} ({summary['failed']/summary['total']*100:.1f}%)")
+    lines.append("SUMMARY")
+    lines.append("════════════════════════════════════════════════════════════════════════════")
+    lines.append(f"  Total Tests:      {summary['total']}")
+    lines.append(f"  Passed:           {summary['passed']} ({summary['pass_rate']*100:.1f}%)")
+    lines.append(f"  Failed:           {summary['failed']} ({summary['failed']/summary['total']*100:.1f}%)")
     if summary['errors'] > 0:
-        print(f"  Errors:           {summary['errors']}")
-    print(f"  Avg Accuracy:     {summary['avg_accuracy']*100:.1f}%")
-    print(f"  Avg Time:         {summary['avg_time_sec']:.2f}s")
-    print(f"  Total Time:       {summary['total_time_sec']:.2f}s")
-    print("════════════════════════════════════════════════════════════════════════════")
+        lines.append(f"  Errors:           {summary['errors']}")
+    lines.append(f"  Avg Accuracy:     {summary['avg_accuracy']*100:.1f}%")
+    lines.append(f"  Avg Time:         {summary['avg_time_sec']:.2f}s")
+    lines.append(f"  Total Time:       {summary['total_time_sec']:.2f}s")
+    lines.append("════════════════════════════════════════════════════════════════════════════")
+
+    output_text = '\n'.join(lines) + '\n'
+
+    if file_path:
+        # Write to file
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w') as f:
+            f.write(output_text)
+    else:
+        # Write to stdout
+        print(output_text, end='')
+
+
+def save_command_script(file_path: str, argv: List[str]):
+    """Save the command used to run the benchmark as a shell script."""
+    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Build the command line
+    cmd_line = ' '.join(argv)
+
+    script_content = f"""#!/bin/bash
+# Benchmark command used to generate results
+# Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}
+
+{cmd_line}
+"""
+
+    with open(file_path, 'w') as f:
+        f.write(script_content)
+
+    # Make executable
+    Path(file_path).chmod(0o755)
 
 
 def main():
@@ -325,7 +371,17 @@ Examples:
         "--output",
         choices=["jsonl", "ascii"],
         default="jsonl",
-        help="Output format (default: jsonl)"
+        help="Output format for stdout (default: jsonl)"
+    )
+    parser.add_argument(
+        "--save-jsonl",
+        metavar="FILE",
+        help="Save JSONL results to file (e.g., results/model.jsonl)"
+    )
+    parser.add_argument(
+        "--save-ascii",
+        metavar="FILE",
+        help="Save ASCII results to file (e.g., results/model.txt)"
     )
     parser.add_argument(
         "--tests",
@@ -381,7 +437,20 @@ Examples:
     results = runner.run_all_tests(llm_args, test_filter)
     summary = runner.calculate_summary(results)
 
-    # Output results
+    # Save to files if requested
+    if args.save_jsonl:
+        output_jsonl(results, summary, args.save_jsonl)
+    if args.save_ascii:
+        output_ascii(results, summary, llm_args, args.save_ascii)
+
+    # Generate command script if saving to files
+    if args.save_jsonl or args.save_ascii:
+        # Use the first available file path to determine base path
+        base_path = args.save_jsonl or args.save_ascii
+        sh_path = str(Path(base_path).with_suffix('.sh'))
+        save_command_script(sh_path, sys.argv)
+
+    # Output to stdout (default behavior)
     if args.output == "jsonl":
         output_jsonl(results, summary)
     else:
