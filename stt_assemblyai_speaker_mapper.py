@@ -525,6 +525,8 @@ def handle_llm_detection(args, json_data, detected_speakers):
     """
     Handle LLM-assisted speaker detection.
 
+    Supports auto-loading from cached suggestions file for faster workflow.
+
     Args:
         args: Parsed arguments
         json_data: Full transcript JSON
@@ -533,8 +535,30 @@ def handle_llm_detection(args, json_data, detected_speakers):
     Returns:
         Speaker mapping dict
     """
+    # Check for cached suggestions file (unless --force)
+    suggestions_path = get_suggestions_file_path(args.input_json)
+
+    if args.llm_interactive and os.path.exists(suggestions_path) and not args.force:
+        # Auto-load cached suggestions
+        try:
+            log_info(args, "Found cached suggestions file, loading...")
+            _, ai_suggestions, metadata = load_suggestions_from_file(suggestions_path, args)
+
+            log_info(args, "Using cached LLM suggestions (use --force to regenerate)")
+
+            # Go directly to interactive review
+            return prompt_interactive_with_suggestions(
+                detected_speakers,
+                ai_suggestions,
+                args
+            )
+        except (FileNotFoundError, ValueError) as e:
+            log_warning(args, f"Failed to load suggestions file: {e}")
+            log_warning(args, "Falling back to LLM generation")
+            # Continue to LLM generation below
+
     # Determine provider spec
-    provider_spec = args.llm_detect or args.llm_interactive or args.llm_detect_fallback
+    provider_spec = args.llm_detect or args.llm_interactive or args.llm_detect_fallback or args.generate_suggestions_only
 
     if not provider_spec:
         # Default provider
@@ -567,6 +591,23 @@ def handle_llm_detection(args, json_data, detected_speakers):
         log_info(args, f"LLM confidence: {detection_result.confidence}")
         if detection_result.reasoning:
             log_info(args, f"LLM reasoning: {detection_result.reasoning}")
+
+        # Save suggestions to file for future use
+        # (unless running in --generate-suggestions-only mode, which saves in main())
+        if not args.generate_suggestions_only:
+            try:
+                save_suggestions_to_file(
+                    suggestions_path,
+                    detected_speakers,
+                    detection_result.speakers,
+                    detection_result,
+                    provider_spec,
+                    args.input_json,
+                    args
+                )
+            except Exception as e:
+                log_warning(args, f"Failed to save suggestions file: {e}")
+                # Non-fatal, continue with workflow
 
         # Interactive mode: show suggestions as defaults
         if args.llm_interactive:
@@ -800,6 +841,119 @@ def generate_output_path(input_path, extension=''):
 
 
 # ----------------------------------------------------------------------
+# Suggestions File I/O
+# ----------------------------------------------------------------------
+
+def get_suggestions_file_path(input_json_path):
+    """
+    Generate suggestions file path from input JSON path.
+
+    Examples:
+        audio.mp3.assemblyai.json → audio.mp3.assemblyai.mapping-suggestions.json
+
+    Args:
+        input_json_path: Path to input JSON file
+
+    Returns:
+        Path to suggestions file
+    """
+    if input_json_path.endswith('.json'):
+        base = input_json_path[:-5]  # Remove .json
+        return f"{base}.mapping-suggestions.json"
+    else:
+        return f"{input_json_path}.mapping-suggestions.json"
+
+
+def save_suggestions_to_file(
+    suggestions_path: str,
+    detected_speakers: set,
+    speaker_suggestions: dict,
+    detection_result,
+    model: str,
+    input_file: str,
+    args
+):
+    """
+    Save LLM speaker suggestions to JSON file for later use.
+
+    Args:
+        suggestions_path: Path to save suggestions file
+        detected_speakers: Set of detected speaker labels
+        speaker_suggestions: Dict of speaker label → name mappings
+        detection_result: SpeakerDetection result from LLM
+        model: Model string used for detection
+        input_file: Original input JSON path
+        args: Arguments namespace
+    """
+    from datetime import datetime, timezone
+
+    suggestions_data = {
+        "detected_speakers": sorted(detected_speakers),
+        "suggestions": speaker_suggestions,
+        "confidence": getattr(detection_result, 'confidence', 'unknown'),
+        "reasoning": getattr(detection_result, 'reasoning', ''),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": model,
+        "input_file": input_file
+    }
+
+    with open(suggestions_path, 'w') as f:
+        json.dump(suggestions_data, f, indent=2)
+
+    log_info(args, f"Saved suggestions to: {suggestions_path}")
+
+
+def load_suggestions_from_file(suggestions_path: str, args):
+    """
+    Load speaker suggestions from JSON file.
+
+    Args:
+        suggestions_path: Path to suggestions file
+        args: Arguments namespace
+
+    Returns:
+        Tuple of (detected_speakers_list, speaker_suggestions_dict, metadata_dict)
+
+    Raises:
+        FileNotFoundError: If suggestions file doesn't exist
+        ValueError: If suggestions file is invalid
+    """
+    try:
+        with open(suggestions_path, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Suggestions file not found: {suggestions_path}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in suggestions file: {e}")
+
+    # Validate required fields
+    required_fields = ['detected_speakers', 'suggestions']
+    for field in required_fields:
+        if field not in data:
+            raise ValueError(f"Suggestions file missing required field: {field}")
+
+    detected_speakers = data['detected_speakers']
+    suggestions = data['suggestions']
+
+    # Metadata
+    metadata = {
+        'confidence': data.get('confidence', 'unknown'),
+        'reasoning': data.get('reasoning', ''),
+        'timestamp': data.get('timestamp', ''),
+        'model': data.get('model', 'unknown'),
+        'input_file': data.get('input_file', '')
+    }
+
+    log_info(args, f"Loaded suggestions from: {suggestions_path}")
+    log_info(args, f"  Model: {metadata['model']}")
+    log_info(args, f"  Confidence: {metadata['confidence']}")
+    if metadata['reasoning']:
+        log_info(args, f"  Reasoning: {metadata['reasoning']}")
+
+    return detected_speakers, suggestions, metadata
+
+
+# ----------------------------------------------------------------------
 # Validation and Logging
 # ----------------------------------------------------------------------
 
@@ -970,6 +1124,12 @@ Shortcut Examples:
         metavar='PROVIDER/MODEL',
         help='Try LLM detection, fall back to manual interactive if it fails'
     )
+    mapping_group.add_argument(
+        '--generate-suggestions-only',
+        metavar='PROVIDER/MODEL',
+        help='Generate speaker name suggestions using LLM and save to file, then exit '
+             '(no mapping applied). Enables batch pre-computation for later interactive review.'
+    )
 
     # LLM configuration (optional)
     parser.add_argument(
@@ -993,7 +1153,7 @@ Shortcut Examples:
     parser.add_argument(
         '-f', '--force',
         action='store_true',
-        help='Overwrite existing output files'
+        help='Overwrite existing output files and force regeneration of cached suggestions'
     )
     parser.add_argument(
         '--txt-only',
@@ -1066,6 +1226,59 @@ def main():
     if args.detect:
         print(f"Detected speakers: {', '.join(sorted(detected_speakers))}")
         return
+
+    # Generate-suggestions-only mode
+    if args.generate_suggestions_only:
+        suggestions_path = get_suggestions_file_path(args.input_json)
+
+        # Check if suggestions already exist (unless --force)
+        if os.path.exists(suggestions_path) and not args.force:
+            log_info(args, f"Suggestions file already exists: {suggestions_path}")
+            log_info(args, "Use --force to regenerate")
+            return
+
+        log_info(args, "Generating speaker name suggestions using LLM...")
+
+        # Call LLM to generate suggestions
+        try:
+            # Extract transcript sample
+            transcript_sample = extract_transcript_sample(
+                json_data,
+                max_utterances=args.llm_sample_size
+            )
+
+            if not transcript_sample:
+                log_error(args, "No transcript utterances found for LLM analysis")
+                sys.exit(1)
+
+            # Call LLM
+            provider_spec = args.generate_suggestions_only
+            detection_result = detect_speakers_llm(
+                provider_spec,
+                transcript_sample,
+                list(detected_speakers),
+                endpoint=args.llm_endpoint,
+                args=args
+            )
+
+            # Save suggestions to file
+            save_suggestions_to_file(
+                suggestions_path,
+                detected_speakers,
+                detection_result.speakers,
+                detection_result,
+                provider_spec,
+                args.input_json,
+                args
+            )
+
+            log_info(args, f"✓ Suggestions saved to: {suggestions_path}")
+            log_info(args, f"Run with --llm-interactive to review and apply mappings")
+            return
+
+        except Exception as e:
+            log_error(args, f"Failed to generate suggestions: {e}")
+            sys.exit(1)
 
     # Build speaker map
     if args.llm_detect or args.llm_interactive or args.llm_detect_fallback:
