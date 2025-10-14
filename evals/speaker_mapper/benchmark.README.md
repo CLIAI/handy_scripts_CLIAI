@@ -51,7 +51,7 @@ cd evals/speaker_mapper
 ### Common Examples
 
 ```bash
-# Generate JSONL output for analysis
+# Generate JSONL output for analysis (to stdout)
 ./benchmark.py --llm-detect 4o-mini > results_4o-mini.jsonl
 
 # Run specific tests only
@@ -62,6 +62,48 @@ cd evals/speaker_mapper
 ./benchmark.py --llm-detect sonnet > results_sonnet.jsonl
 ./benchmark.py --llm-detect smollm2:1.7b --llm-endpoint http://localhost:11434/v1 > results_smollm2.jsonl
 ```
+
+### Saving Results to Files
+
+The benchmark script supports saving results directly to files, which automatically generates three files:
+
+* `.jsonl` - Machine-readable JSON Lines format
+* `.txt` - Human-readable ASCII table format
+* `.sh` - Executable shell script with the exact command used (for reproducibility)
+
+```bash
+# Save results to files with both JSONL and ASCII formats
+./benchmark.py --llm-detect 4o-mini \
+  --save-jsonl results/openai_4o-mini.jsonl \
+  --save-ascii results/openai_4o-mini.txt
+
+# This generates three files:
+# - results/openai_4o-mini.jsonl (detailed results)
+# - results/openai_4o-mini.txt (human-readable report)
+# - results/openai_4o-mini.sh (command used to generate results)
+
+# Save only JSONL format
+./benchmark.py --llm-detect smollm2:1.7b \
+  --llm-endpoint http://localhost:11434/v1 \
+  --save-jsonl results/ollama_smollm2_1.7b.jsonl
+
+# Save only ASCII format
+./benchmark.py --llm-detect sonnet \
+  --save-ascii results/anthropic_sonnet.txt
+
+# Combine with --output flag to also display results on stdout
+./benchmark.py --llm-detect 4o-mini \
+  --save-jsonl results/openai_4o-mini.jsonl \
+  --save-ascii results/openai_4o-mini.txt \
+  --output ascii  # Also display ASCII table on screen
+```
+
+**Benefits**:
+
+* **Reproducibility**: The `.sh` file captures the exact command with timestamp
+* **Organization**: Results organized in `results/` directory with consistent naming
+* **Comparison**: Easy to compare multiple model runs side-by-side
+* **Archiving**: Keep historical results for tracking model improvements over time
 
 ## Test Cases
 
@@ -292,19 +334,36 @@ Create corresponding reference in `references/` directory:
 
 ```bash
 # OpenAI models
-./benchmark.py --llm-detect 4o-mini > results/4o-mini.jsonl
-./benchmark.py --llm-detect 4o > results/4o.jsonl
+./benchmark.py --llm-detect 4o-mini \
+  --save-jsonl results/openai_4o-mini.jsonl \
+  --save-ascii results/openai_4o-mini.txt
+
+./benchmark.py --llm-detect 4o \
+  --save-jsonl results/openai_4o.jsonl \
+  --save-ascii results/openai_4o.txt
 
 # Anthropic models
-./benchmark.py --llm-detect sonnet > results/sonnet.jsonl
-./benchmark.py --llm-detect haiku > results/haiku.jsonl
+./benchmark.py --llm-detect sonnet \
+  --save-jsonl results/anthropic_sonnet.jsonl \
+  --save-ascii results/anthropic_sonnet.txt
+
+./benchmark.py --llm-detect haiku \
+  --save-jsonl results/anthropic_haiku.jsonl \
+  --save-ascii results/anthropic_haiku.txt
 
 # Google models
-./benchmark.py --llm-detect gemini > results/gemini.jsonl
+./benchmark.py --llm-detect gemini \
+  --save-jsonl results/google_gemini.jsonl \
+  --save-ascii results/google_gemini.txt
 
 # Local Ollama models
-./benchmark.py --llm-detect smollm2:1.7b --llm-endpoint http://localhost:11434/v1 > results/smollm2-1.7b.jsonl
-./benchmark.py --llm-detect llama3.2:1b --llm-endpoint http://localhost:11434/v1 > results/llama3.2-1b.jsonl
+./benchmark.py --llm-detect smollm2:1.7b --llm-endpoint http://localhost:11434/v1 \
+  --save-jsonl results/ollama_smollm2_1.7b.jsonl \
+  --save-ascii results/ollama_smollm2_1.7b.txt
+
+./benchmark.py --llm-detect llama3.2:1b --llm-endpoint http://localhost:11434/v1 \
+  --save-jsonl results/ollama_llama3.2_1b.jsonl \
+  --save-ascii results/ollama_llama3.2_1b.txt
 ```
 
 ### Analyze Results
