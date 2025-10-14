@@ -54,3 +54,6 @@ htmlcov/
 *.swp
 *.swo
 *~
+
+# Benchmark results
+evals/speaker_mapper/results/
