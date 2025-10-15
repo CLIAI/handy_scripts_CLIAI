@@ -38,7 +38,7 @@ from typing import Dict, List, Optional, Union
 # Optional LLM detection support
 try:
     import instructor
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, ConfigDict
     from openai import OpenAI
     INSTRUCTOR_AVAILABLE = True
 except ImportError:
@@ -46,6 +46,7 @@ except ImportError:
     instructor = None
     BaseModel = None
     Field = None
+    ConfigDict = None
     OpenAI = None
 
 # ----------------------------------------------------------------------
@@ -378,6 +379,8 @@ if INSTRUCTOR_AVAILABLE:
 
     class SpeakerDetection(BaseModel):
         """Pydantic model for LLM speaker detection response."""
+        model_config = ConfigDict(extra='allow')
+
         speakers: List[SpeakerMapping] = Field(
             description='List of speaker mappings. Must include one mapping for EACH detected speaker label.'
         )
