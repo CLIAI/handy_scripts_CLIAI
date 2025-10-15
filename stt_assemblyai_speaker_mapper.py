@@ -371,6 +371,10 @@ if INSTRUCTOR_AVAILABLE:
         speaker_name: str = Field(
             description="Identified name or role for this speaker"
         )
+        context: str = Field(
+            description="Brief contextual information about this speaker: topics discussed, role in conversation, keywords, adjectives, or identifying characteristics to help identify them even if name is uncertain",
+            default=""
+        )
 
     class SpeakerDetection(BaseModel):
         """Pydantic model for LLM speaker detection response."""
@@ -503,22 +507,36 @@ def detect_speakers_llm(
 
 DETECTED SPEAKERS: {', '.join(detected_labels)}
 
-Your task is to create a mapping of each detected speaker label to their actual name or professional role.
+Your task is to create a mapping of each detected speaker label to their actual name or professional role, along with contextual information to help identify them.
 
 Look for:
 - Direct name mentions (e.g., "Hi Alice", "Thanks Bob")
 - Introductions ("I'm...", "My name is...")
 - Self-references using third person ("Alice is happy", "Bob appreciates")
 - Professional roles if names aren't mentioned (Host, Guest, Expert, Interviewer)
+- Topics they discussed (AI, research, product features, etc.)
+- Their role in the conversation (asking questions, explaining, presenting, etc.)
+- Keywords, adjectives, or characteristics that identify them
 
 TRANSCRIPT SAMPLE:
 {transcript_sample}
 
-You must provide a mapping for EACH detected speaker label ({', '.join(detected_labels)}) to their identified name or role.
-Use "Unknown" only if you cannot determine identity with reasonable confidence.
+You must provide a mapping for EACH detected speaker label ({', '.join(detected_labels)}) including:
+1. speaker_label: The label (A, B, C, etc.)
+2. speaker_name: Their identified name or role (use "Unknown" if uncertain)
+3. context: Brief contextual info about this speaker - topics discussed, role, keywords, or identifying characteristics (even if name is uncertain)
 
-Example output format:
-- If detected speakers are ["A", "B"], you should return: {{"A": "Alice Anderson", "B": "Bob Martinez"}}
+Example output format for speakers ["A", "B"]:
+{{
+  "speakers": [
+    {{"speaker_label": "A", "speaker_name": "Alice Anderson", "context": "Host, asked questions about AI ethics and neural networks"}},
+    {{"speaker_label": "B", "speaker_name": "Unknown", "context": "Guest expert, discussed research background and transformer architectures"}}
+  ],
+  "confidence": "medium",
+  "reasoning": "Speaker A identified by introduction, Speaker B's name not mentioned"
+}}
+
+The context field should help identify the speaker even if the name is wrong or unknown.
 """
 
     try:
@@ -552,8 +570,14 @@ Example output format:
         log_debug(args, f"LLM response - Speakers: {result.speakers}")
         log_debug(args, f"LLM response - Reasoning: {result.reasoning}")
 
+        # Extract speaker contexts before converting to dict
+        speaker_contexts = {mapping.speaker_label: mapping.context for mapping in result.speakers}
+
         # Convert List[SpeakerMapping] back to Dict[str, str] for compatibility
         result.speakers = {mapping.speaker_label: mapping.speaker_name for mapping in result.speakers}
+
+        # Store contexts as a separate attribute for interactive mode
+        result.speaker_contexts = speaker_contexts
 
         return result
 
@@ -588,9 +612,12 @@ def handle_llm_detection(args, json_data, detected_speakers):
             log_info(args, "Using cached LLM suggestions (use --force to regenerate)")
 
             # Go directly to interactive review
+            # Note: metadata might not have contexts for older cached files
+            speaker_contexts = metadata.get('speaker_contexts', {})
             return prompt_interactive_with_suggestions(
                 detected_speakers,
                 ai_suggestions,
+                speaker_contexts,
                 args
             )
         except (FileNotFoundError, ValueError) as e:
@@ -652,9 +679,12 @@ def handle_llm_detection(args, json_data, detected_speakers):
 
         # Interactive mode: show suggestions as defaults
         if args.llm_interactive:
+            # Get contexts from detection result
+            speaker_contexts = getattr(detection_result, 'speaker_contexts', {})
             return prompt_interactive_with_suggestions(
                 detected_speakers,
                 detection_result.speakers,
+                speaker_contexts,
                 args
             )
 
@@ -683,6 +713,7 @@ def handle_llm_detection(args, json_data, detected_speakers):
 def prompt_interactive_with_suggestions(
     detected_speakers: set,
     ai_suggestions: dict,
+    speaker_contexts: dict,
     args
 ) -> dict:
     """
@@ -691,19 +722,28 @@ def prompt_interactive_with_suggestions(
     Args:
         detected_speakers: Set of speaker labels
         ai_suggestions: Dict of AI-suggested names
+        speaker_contexts: Dict of speaker labels to context information
         args: Arguments namespace
 
     Returns:
-        Final speaker mapping dict
+        Final speaker mapping dict, or None if user chooses to skip
     """
     # First, show ALL AI-detected mappings upfront for context
     print("\n=== AI-Detected Speaker Mappings ===", file=sys.stderr)
     for speaker in sorted(detected_speakers):
         suggestion = ai_suggestions.get(speaker, "Unknown")
-        print(f"{speaker} => {suggestion}", file=sys.stderr)
+        context = speaker_contexts.get(speaker, "")
+        if context:
+            print(f"{speaker} => {suggestion} # {context}", file=sys.stderr)
+        else:
+            print(f"{speaker} => {suggestion}", file=sys.stderr)
 
     # Then prompt for confirmation/override
-    print("\n=== Review and Confirm (press Enter to accept, or type to override) ===", file=sys.stderr)
+    print("\n=== Review and Confirm ===", file=sys.stderr)
+    print("  - Press Enter to accept suggestion", file=sys.stderr)
+    print("  - Type name to override", file=sys.stderr)
+    print("  - Type 'skip' to abort mapping (can rerun later)", file=sys.stderr)
+    print("", file=sys.stderr)
 
     speaker_map = {}
 
@@ -714,6 +754,12 @@ def prompt_interactive_with_suggestions(
         # Prompt with format: "A => [Alice Anderson]: "
         prompt_text = f"{speaker} => [{suggestion}]: "
         user_input = input(prompt_text).strip()
+
+        # Check for skip command
+        if user_input.lower() == 'skip':
+            print("\nSkipping speaker mapping - no files will be created.", file=sys.stderr)
+            print("You can rerun this command later to map speakers.", file=sys.stderr)
+            return None
 
         if user_input:
             # User override
@@ -939,6 +985,7 @@ def save_suggestions_to_file(
     suggestions_data = {
         "detected_speakers": sorted(detected_speakers),
         "suggestions": speaker_suggestions,
+        "speaker_contexts": getattr(detection_result, 'speaker_contexts', {}),
         "confidence": getattr(detection_result, 'confidence', 'unknown'),
         "reasoning": getattr(detection_result, 'reasoning', ''),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -990,7 +1037,8 @@ def load_suggestions_from_file(suggestions_path: str, args):
         'reasoning': data.get('reasoning', ''),
         'timestamp': data.get('timestamp', ''),
         'model': data.get('model', 'unknown'),
-        'input_file': data.get('input_file', '')
+        'input_file': data.get('input_file', ''),
+        'speaker_contexts': data.get('speaker_contexts', {})
     }
 
     log_info(args, f"Loaded suggestions from: {suggestions_path}")
@@ -1364,6 +1412,11 @@ def main():
     else:
         log_error(args, "No mapping source provided (use -m, -M, --interactive, or --llm-detect)")
         sys.exit(1)
+
+    # Check if user skipped mapping (returns None)
+    if speaker_map is None:
+        log_info(args, "Mapping skipped by user - exiting without creating files")
+        return
 
     if not speaker_map:
         log_warning(args, "Empty speaker mapping - no changes will be made")
