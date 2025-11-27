@@ -220,7 +220,7 @@ def get_meta_message(args):
     # Check for custom message
     custom_message = os.environ.get('STT_META_MESSAGE', '').strip()
     if custom_message:
-        return f"META:\t{custom_message}\n"
+        return f"---\nmeta: {custom_message}\n---\n"
 
     # Default META message
     default_message = (
@@ -236,7 +236,7 @@ def get_meta_message(args):
         "When critical accuracy is required, please verify important details against the original audio source."
     )
 
-    return f"META:\t{default_message}\n"
+    return f"---\nmeta: {default_message}\n---\n"
 
 
 # ----------------------------------------------------------------------
@@ -621,6 +621,7 @@ def handle_llm_detection(args, json_data, detected_speakers):
                 detected_speakers,
                 ai_suggestions,
                 speaker_contexts,
+                args.input_json,
                 args
             )
         except (FileNotFoundError, ValueError) as e:
@@ -688,6 +689,7 @@ def handle_llm_detection(args, json_data, detected_speakers):
                 detected_speakers,
                 detection_result.speakers,
                 speaker_contexts,
+                args.input_json,
                 args
             )
 
@@ -713,10 +715,186 @@ def handle_llm_detection(args, json_data, detected_speakers):
             raise
 
 
+def expand_command_placeholders(command: str, input_json: str) -> str:
+    """
+    Expand placeholders in command with actual file paths.
+
+    Args:
+        command: Command string with placeholders like {audio}, {text}, etc.
+        input_json: Path to input JSON file (e.g., audio.mp3.assemblyai.json)
+
+    Returns:
+        Command with placeholders replaced by quoted file paths
+
+    Supported placeholders:
+        {audio} {a}           - Original audio file (audio.mp3)
+        {text} {transcript} {t} {txt} - Base transcript (audio.mp3.txt)
+        {json} {j}            - Base JSON (audio.mp3.assemblyai.json)
+        {mapped-json} {mj}    - Mapped JSON (audio.mp3.assemblyai.mapped.json)
+        {mapped-text} {mapped-txt} {mt} - Mapped text (audio.mp3.assemblyai.mapped.txt)
+        {suggestions} {suggestions-json} {sj} - Suggestions (audio.mp3.assemblyai.mapping-suggestions.json)
+    """
+    import shlex
+    import os
+
+    # Derive audio file path from JSON path
+    # audio.mp3.assemblyai.json → audio.mp3
+    if input_json.endswith('.assemblyai.json'):
+        base_audio = input_json[:-len('.assemblyai.json')]
+    else:
+        # Fallback: use input_json as base
+        base_audio = input_json
+
+    # Build file paths
+    files = {
+        # Audio
+        '{audio}': base_audio,
+        '{a}': base_audio,
+
+        # Text transcript
+        '{text}': f'{base_audio}.txt',
+        '{transcript}': f'{base_audio}.txt',
+        '{t}': f'{base_audio}.txt',
+        '{txt}': f'{base_audio}.txt',
+
+        # Base JSON
+        '{json}': input_json,
+        '{j}': input_json,
+
+        # Mapped outputs
+        '{mapped-json}': f'{base_audio}.assemblyai.mapped.json',
+        '{mj}': f'{base_audio}.assemblyai.mapped.json',
+        '{mapped-text}': f'{base_audio}.assemblyai.mapped.txt',
+        '{mapped-txt}': f'{base_audio}.assemblyai.mapped.txt',
+        '{mt}': f'{base_audio}.assemblyai.mapped.txt',
+
+        # Suggestions
+        '{suggestions}': f'{base_audio}.assemblyai.mapping-suggestions.json',
+        '{suggestions-json}': f'{base_audio}.assemblyai.mapping-suggestions.json',
+        '{sj}': f'{base_audio}.assemblyai.mapping-suggestions.json',
+    }
+
+    # Replace placeholders with quoted paths
+    result = command
+    for placeholder, filepath in files.items():
+        if placeholder in result:
+            # Quote the filepath to handle spaces
+            quoted = shlex.quote(filepath)
+            result = result.replace(placeholder, quoted)
+
+    return result
+
+
+def execute_command(command: str, input_json: str, args) -> bool:
+    """
+    Execute a shell command with placeholder expansion.
+
+    Args:
+        command: Command to execute (may contain placeholders)
+        input_json: Path to input JSON file
+        args: Arguments namespace
+
+    Returns:
+        True if command executed successfully, False otherwise
+    """
+    import subprocess
+    import termios
+    import os
+
+    # Expand placeholders
+    expanded = expand_command_placeholders(command, input_json)
+
+    # Show what we're executing
+    print(f"\n→ Executing: {expanded}", file=sys.stderr)
+
+    # Save terminal state BEFORE launching subprocess
+    fd = sys.stdin.fileno()
+    old_attrs = None
+    if os.isatty(fd):
+        try:
+            old_attrs = termios.tcgetattr(fd)
+        except Exception:
+            pass  # Not a terminal or can't get attributes
+
+    try:
+        # Execute command with shell, letting it inherit terminal directly
+        # NO stdin/stdout/stderr redirection - subprocess gets full terminal control
+        result = subprocess.run(
+            expanded,
+            shell=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            # Check if killed by signal (negative return codes)
+            if result.returncode < 0:
+                signal_num = -result.returncode
+                if signal_num == 2:  # SIGINT
+                    log_debug(args, "Command interrupted by user (Ctrl+C)")
+                else:
+                    log_warning(args, f"Command killed by signal {signal_num}")
+            else:
+                log_warning(args, f"Command exited with code {result.returncode}")
+            return False
+
+        return True
+
+    except Exception as e:
+        log_error(args, f"Command execution failed: {e}")
+        return False
+
+    finally:
+        # Clear stdin buffer to remove any pending input
+        if sys.stdin.isatty():
+            try:
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except Exception:
+                pass
+
+        # Restore terminal state
+        if old_attrs:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            except Exception:
+                pass
+
+
+def show_command_help():
+    """Show available commands and placeholders."""
+    help_text = """
+=== Interactive Commands ===
+
+Special commands:
+  skip              - Abort mapping (can rerun later)
+  help              - Show this help message
+  play              - Play audio file (alias for: !play {audio})
+  !<command>        - Execute shell command with placeholders
+
+Placeholders (use in ! commands):
+  {audio} {a}       - Original audio file
+  {text} {t}        - Base transcript (.txt)
+  {json} {j}        - Base JSON (.assemblyai.json)
+  {mapped-text} {mt} - Mapped transcript (output)
+  {mapped-json} {mj} - Mapped JSON (output)
+  {suggestions} {sj} - Speaker suggestions (.mapping-suggestions.json)
+
+Examples:
+  !play {audio}           - Play the audio file
+  !less {text}            - View transcript
+  !jq .speakers {json}    - Inspect speakers in JSON
+  !head -50 {text}        - Show first 50 lines
+  !grep "Alice" {text}    - Search for keyword
+
+Press Enter to accept AI suggestion, or type a name to override.
+"""
+    print(help_text, file=sys.stderr)
+
+
 def prompt_interactive_with_suggestions(
     detected_speakers: set,
     ai_suggestions: dict,
     speaker_contexts: dict,
+    input_json: str,
     args
 ) -> dict:
     """
@@ -726,6 +904,7 @@ def prompt_interactive_with_suggestions(
         detected_speakers: Set of speaker labels
         ai_suggestions: Dict of AI-suggested names
         speaker_contexts: Dict of speaker labels to context information
+        input_json: Path to input JSON file (for command execution)
         args: Arguments namespace
 
     Returns:
@@ -743,9 +922,8 @@ def prompt_interactive_with_suggestions(
 
     # Then prompt for confirmation/override
     print("\n=== Review and Confirm ===", file=sys.stderr)
-    print("  - Press Enter to accept suggestion", file=sys.stderr)
-    print("  - Type name to override", file=sys.stderr)
-    print("  - Type 'skip' to abort mapping (can rerun later)", file=sys.stderr)
+    print("  Enter=accept | name=override | skip=abort | help=commands | play=audio", file=sys.stderr)
+    print("  !cmd: run shell commands with {a}udio {t}ext {j}son {mt}apped-text placeholders", file=sys.stderr)
     print("", file=sys.stderr)
 
     speaker_map = {}
@@ -756,14 +934,53 @@ def prompt_interactive_with_suggestions(
 
         # Prompt with format: "A => [Alice Anderson]: "
         prompt_text = f"{speaker} => [{suggestion}]: "
-        user_input = input(prompt_text).strip()
 
-        # Check for skip command
-        if user_input.lower() == 'skip':
-            print("\nSkipping speaker mapping - no files will be created.", file=sys.stderr)
-            print("You can rerun this command later to map speakers.", file=sys.stderr)
-            return None
+        while True:  # Loop to allow commands without consuming the prompt
+            try:
+                user_input = input(prompt_text).strip()
+            except (EOFError, KeyboardInterrupt):
+                # Handle Ctrl+C or Ctrl+D - treat as skip request
+                print("\n\nInterrupted - skipping speaker mapping.", file=sys.stderr)
+                print("You can rerun this command later to map speakers.", file=sys.stderr)
+                return None
 
+            # Check for special commands
+            if user_input.lower() == 'skip':
+                print("\nSkipping speaker mapping - no files will be created.", file=sys.stderr)
+                print("You can rerun this command later to map speakers.", file=sys.stderr)
+                return None
+
+            elif user_input.lower() == 'help':
+                show_command_help()
+                continue  # Re-prompt for same speaker
+
+            elif user_input.lower() == 'play':
+                # Built-in alias for !play {audio}
+                try:
+                    execute_command('play {audio}', input_json, args)
+                except KeyboardInterrupt:
+                    # User pressed Ctrl+C during command execution - just continue prompting
+                    print("", file=sys.stderr)
+                continue  # Re-prompt for same speaker
+
+            elif user_input.startswith('!'):
+                # Execute arbitrary command
+                command = user_input[1:].strip()  # Remove '!' prefix
+                if command:
+                    try:
+                        execute_command(command, input_json, args)
+                    except KeyboardInterrupt:
+                        # User pressed Ctrl+C during command execution - just continue prompting
+                        print("", file=sys.stderr)
+                else:
+                    log_warning(args, "Empty command after '!'")
+                continue  # Re-prompt for same speaker
+
+            else:
+                # Normal speaker name input
+                break
+
+        # Process speaker name (user_input is now a name or empty)
         if user_input:
             # User override
             speaker_map[speaker] = user_input
@@ -1093,7 +1310,7 @@ def validate_and_log_mapping(speaker_map, detected_speakers, args):
 def write_json(filepath, data, args):
     """Write JSON data to file with optional META note."""
     # Add META note to JSON if enabled
-    meta_message_text = get_meta_message(args).replace("META:\t", "").strip()
+    meta_message_text = get_meta_message(args).replace("---\nmeta: ", "").replace("\n---\n", "").strip()
     if meta_message_text:
         data_with_meta = {
             "_meta_note": meta_message_text,

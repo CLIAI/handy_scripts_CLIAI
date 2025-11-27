@@ -42,7 +42,7 @@ def get_meta_message(args):
     # Check for custom message
     custom_message = os.environ.get('STT_META_MESSAGE', '').strip()
     if custom_message:
-        return f"META:\t{custom_message}\n"
+        return f"---\nmeta: {custom_message}\n---\n"
 
     # Default META message
     default_message = (
@@ -58,7 +58,7 @@ def get_meta_message(args):
         "When critical accuracy is required, please verify important details against the original audio source."
     )
 
-    return f"META:\t{default_message}\n"
+    return f"---\nmeta: {default_message}\n---\n"
 
 # Argument parsing
 parser = argparse.ArgumentParser(description='OpenAI STT/ASR CLI (Voice to Text)')

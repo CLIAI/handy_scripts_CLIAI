@@ -185,7 +185,7 @@ def get_meta_message(args):
     # Check for custom message
     custom_message = os.environ.get('STT_META_MESSAGE', '').strip()
     if custom_message:
-        return f"META:\t{custom_message}\n"
+        return f"---\nmeta: {custom_message}\n---\n"
 
     # Default META message
     default_message = (
@@ -201,7 +201,7 @@ def get_meta_message(args):
         "When critical accuracy is required, please verify important details against the original audio source."
     )
 
-    return f"META:\t{default_message}\n"
+    return f"---\nmeta: {default_message}\n---\n"
 
 
 def write_str(args, output, string, mode='w'):
@@ -218,7 +218,7 @@ def write_transcript_to_file(args, output, transcript, audio_input):
     json_path = make_safe_filename(audio_input + '.assemblyai.json')
 
     # Add META note to JSON if enabled
-    meta_message_text = get_meta_message(args).replace("META:\t", "").strip()
+    meta_message_text = get_meta_message(args).replace("---\nmeta: ", "").replace("\n---\n", "").strip()
     if meta_message_text:
         transcript_with_meta = {
             "_meta_note": meta_message_text,
