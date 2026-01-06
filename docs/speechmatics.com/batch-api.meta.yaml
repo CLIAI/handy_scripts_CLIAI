@@ -1,0 +1,6 @@
+url: "https://docs.speechmatics.com/jobsapi"
+title: "Speechmatics ASR REST API | Speechmatics Docs"
+fetched_at: "2026-01-06T22:08:49+01:00"
+description: "REST API documentation for batch transcription jobs, including endpoints, request formats, and response structures"
+additional_urls:
+  - "https://docs.speechmatics.com/api-ref/batch/create-a-new-job"

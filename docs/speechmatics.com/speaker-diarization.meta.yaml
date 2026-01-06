@@ -1,0 +1,7 @@
+url: "https://docs.speechmatics.com/features/diarization"
+title: "Diarization | Speechmatics Docs"
+fetched_at: "2026-01-06T22:08:49+01:00"
+description: "Complete speaker diarization documentation including all configuration options, parameters, and examples for batch and realtime"
+additional_urls:
+  - "https://docs.speechmatics.com/speech-to-text/batch/batch-diarization"
+  - "https://docs.speechmatics.com/speech-to-text/realtime/realtime-diarization"
