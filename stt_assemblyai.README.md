@@ -462,9 +462,39 @@ INFO: Done.
 
 The tool polls AssemblyAI every 5 seconds for status updates. For very short audio, this means the transcript may appear faster than expected.
 
+## Integration with stt-in-batch
+
+When using the `stt-in-batch` pipeline, language is automatically detected from filenames:
+
+### Filename Language Detection
+
+Include **case-sensitive** language codes with separators (space, dot, dash, underscore):
+
+| Pattern | Language | Example |
+|---------|----------|---------|
+| `EN` | English | `meeting_EN.mp3` → `-l en` |
+| `PL` | Polish | `call-PL.wav` → `-l pl` |
+| `DE` | German | `interview.DE.mp3` → `-l de` |
+| `AUTO` | Auto-detect | `podcast_AUTO.mp3` → `-l auto` |
+
+**Examples:**
+
+```bash
+meeting_EN.mp3      # Uses English
+podcast-PL.mp3      # Uses Polish
+call.DE.wav         # Uses German
+recording_AUTO.mp3  # Auto-detects language
+untitled.mp3        # Defaults to English
+```
+
+**Pattern requirements:** Code must be surrounded by separators (`_EN_`, `-EN-`, `.EN.`, ` EN `, etc.)
+
+See `stt-in-batch.README.md` for full documentation.
+
 ## Related Tools
 
 * **stt_assemblyai_speaker_mapper.py** - Map speaker labels (A, B, C) to actual names
+* **stt-in-batch** - Batch processing pipeline with language detection
 * **stt_video_using_assemblyai.sh** - Wrapper script for video transcription
 * **stt_openai_OR_local_whisper_cli.py** - Alternative tool using OpenAI Whisper
 

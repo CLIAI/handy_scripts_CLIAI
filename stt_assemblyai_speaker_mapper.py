@@ -14,18 +14,38 @@ Post-processing tool to replace speaker labels (A, B, C) with actual names
 in AssemblyAI transcription JSON files. Uses recursive traversal to handle
 any JSON structure, making it future-proof and format-agnostic.
 
+Features:
+- LLM-assisted speaker detection with multiple provider support
+- Interactive mapping with AI suggestions as defaults
+- Audio preview: hear samples of each speaker during mapping
+- Verification mode: review and correct existing mappings with audio
+- Speaker audio extraction: save speaker segments to separate files
+
 Usage:
     # Detect speakers
     ./stt_assemblyai_speaker_mapper.py --detect audio.assemblyai.json
 
+    # LLM-assisted interactive (AI suggestions + audio preview)
+    ./stt_assemblyai_speaker_mapper.py --llm-interactive gpt-4o-mini audio.assemblyai.json
+
+    # Preview audio samples for a speaker
+    ./stt_assemblyai_speaker_mapper.py --preview-speaker A audio.assemblyai.json
+
+    # Verify/review existing mappings with audio
+    ./stt_assemblyai_speaker_mapper.py --verify audio.assemblyai.mapped.json
+
+    # Extract speaker audio to file
+    ./stt_assemblyai_speaker_mapper.py --extract-speaker A -o speaker_a.mp3 audio.assemblyai.json
+
     # Map via inline comma-separated names
     ./stt_assemblyai_speaker_mapper.py -m "Alice,Bob" audio.assemblyai.json
 
-    # Map via file (auto-detects format)
-    ./stt_assemblyai_speaker_mapper.py -M speakers.txt audio.assemblyai.json
-
-    # Interactive mapping
+    # Interactive mapping (manual)
     ./stt_assemblyai_speaker_mapper.py --interactive audio.assemblyai.json
+
+Requirements for audio features:
+    - ffmpeg (for audio extraction)
+    - mpv, ffplay, or mplayer (for playback with seeking)
 """
 
 import argparse
@@ -33,7 +53,10 @@ import sys
 import json
 import os
 import re
-from typing import Dict, List, Optional, Union
+import shutil
+import tempfile
+import subprocess
+from typing import Dict, List, Optional, Union, Tuple
 
 # Optional LLM detection support
 try:
@@ -261,6 +284,449 @@ def log_debug(args, message):
         print(f"DEBUG: {message}", file=sys.stderr)
 
 # ----------------------------------------------------------------------
+# About File Helper
+# ----------------------------------------------------------------------
+
+def get_about_file_path(input_json: str) -> str:
+    """
+    Generate about file path from input JSON path.
+
+    Examples:
+        audio.mp3.assemblyai.json → audio.mp3.about.md
+
+    Args:
+        input_json: Path to input JSON file
+
+    Returns:
+        Path to about file
+    """
+    if input_json.endswith('.assemblyai.json'):
+        base_audio = input_json[:-len('.assemblyai.json')]
+    else:
+        base_audio = input_json
+    return f"{base_audio}.about.md"
+
+
+def get_about_file_content(input_json: str) -> Optional[str]:
+    """
+    Load .about.md file content if it exists.
+
+    About files provide context about the audio (speaker names, roles, topics)
+    to help improve LLM speaker detection accuracy.
+
+    Args:
+        input_json: Path to input JSON file
+
+    Returns:
+        Content of about file, or None if file doesn't exist
+    """
+    about_path = get_about_file_path(input_json)
+
+    if os.path.exists(about_path):
+        try:
+            with open(about_path, 'r') as f:
+                return f.read().strip()
+        except Exception:
+            return None
+    return None
+
+
+# Directory context filename (searched in parent directories)
+DIRECTORY_CONTEXT_FILENAME = "SPEAKER.CONTEXT.md"
+
+
+def find_directory_context_file(input_json: str) -> Optional[str]:
+    """
+    Find SPEAKER.CONTEXT.md in same directory or parent directories.
+
+    Searches both original path and resolved path (via realpath).
+    Similar to how .gitignore or .editorconfig files work.
+
+    Args:
+        input_json: Path to input JSON file
+
+    Returns:
+        Path to found context file, or None if not found
+    """
+    # Get base audio path
+    if input_json.endswith('.assemblyai.json'):
+        base_audio = input_json[:-len('.assemblyai.json')]
+    else:
+        base_audio = input_json
+
+    original_dir = os.path.dirname(os.path.abspath(base_audio)) or '.'
+    resolved_dir = os.path.dirname(os.path.realpath(base_audio)) or '.'
+
+    # Walk up both paths, collect unique directories
+    dirs_to_check = []
+    for start_dir in [original_dir, resolved_dir]:
+        current = start_dir
+        while current:
+            if current not in dirs_to_check:
+                dirs_to_check.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:  # Reached root
+                break
+            current = parent
+
+    # Return first found
+    for dir_path in dirs_to_check:
+        context_path = os.path.join(dir_path, DIRECTORY_CONTEXT_FILENAME)
+        if os.path.exists(context_path):
+            return context_path
+    return None
+
+
+def get_directory_context_content(input_json: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Load directory context file content if it exists.
+
+    Args:
+        input_json: Path to input JSON file
+
+    Returns:
+        Tuple of (content, path) or (None, None) if not found
+    """
+    context_path = find_directory_context_file(input_json)
+    if context_path:
+        try:
+            with open(context_path, 'r') as f:
+                return f.read().strip(), context_path
+        except Exception:
+            return None, None
+    return None, None
+
+
+# ----------------------------------------------------------------------
+# Audio Preview Functions
+# ----------------------------------------------------------------------
+
+def find_audio_player() -> Tuple[Optional[str], List[str]]:
+    """
+    Find available audio player with seeking support.
+
+    Checks for players in order of preference:
+    1. mpv - Best choice, excellent seeking, terminal-friendly
+    2. ffplay - Good fallback, comes with ffmpeg
+    3. mplayer - Older but capable
+
+    Returns:
+        Tuple of (player_name, base_command_args) or (None, []) if none found
+    """
+    players = [
+        ('mpv', ['mpv', '--no-video', '--term-osd-bar']),
+        ('ffplay', ['ffplay', '-nodisp', '-autoexit']),
+        ('mplayer', ['mplayer', '-vo', 'null']),
+    ]
+
+    for name, cmd in players:
+        if shutil.which(cmd[0]):
+            return name, cmd
+
+    return None, []
+
+
+def find_ffmpeg() -> Optional[str]:
+    """Check if ffmpeg is available."""
+    return shutil.which('ffmpeg')
+
+
+def get_audio_file_path(input_json: str) -> str:
+    """
+    Derive audio file path from JSON path.
+
+    Examples:
+        audio.mp3.assemblyai.json → audio.mp3
+        audio.mp3.assemblyai.mapped.json → audio.mp3
+
+    Args:
+        input_json: Path to JSON file
+
+    Returns:
+        Path to original audio file
+    """
+    path = input_json
+    # Remove known suffixes
+    for suffix in ['.assemblyai.mapped.json', '.assemblyai.json', '.mapped.json']:
+        if path.endswith(suffix):
+            return path[:-len(suffix)]
+    # Fallback: just remove .json
+    if path.endswith('.json'):
+        return path[:-5]
+    return path
+
+
+def get_speaker_utterances(
+    json_data: dict,
+    speaker_label: str
+) -> List[dict]:
+    """
+    Get all utterances for a specific speaker with timing info.
+
+    Args:
+        json_data: Full AssemblyAI JSON data
+        speaker_label: Speaker label to filter (e.g., 'A', 'B')
+
+    Returns:
+        List of utterance dicts with 'start', 'end', 'text' keys
+    """
+    utterances = json_data.get('utterances', [])
+    return [u for u in utterances if u.get('speaker') == speaker_label]
+
+
+def format_duration(ms: int) -> str:
+    """Format milliseconds as human-readable duration."""
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}m {secs:.0f}s"
+
+
+def extract_speaker_audio(
+    audio_file: str,
+    utterances: List[dict],
+    output_file: str,
+    max_samples: int = 10,
+    max_duration_per_sample: float = 8.0,
+    silence_gap: float = 0.3,
+    args=None
+) -> Tuple[bool, str]:
+    """
+    Extract and concatenate speaker audio samples using ffmpeg.
+
+    Uses ffmpeg's filter_complex for efficient single-pass extraction.
+    Adds short silence between samples for clarity.
+
+    Args:
+        audio_file: Path to source audio file
+        utterances: List of utterance dicts with 'start' and 'end' (in ms)
+        output_file: Path to output concatenated audio
+        max_samples: Maximum number of samples to extract
+        max_duration_per_sample: Max duration per sample in seconds
+        silence_gap: Silence duration between samples in seconds
+        args: Arguments namespace for logging
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    if not utterances:
+        return False, "No utterances found for speaker"
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return False, "ffmpeg not found. Install with: sudo pacman -S ffmpeg"
+
+    if not os.path.exists(audio_file):
+        return False, f"Audio file not found: {audio_file}"
+
+    # Select samples (first N, capped by max_duration_per_sample)
+    selected = []
+    for utt in utterances[:max_samples]:
+        start_ms = utt.get('start', 0)
+        end_ms = utt.get('end', 0)
+        duration_s = (end_ms - start_ms) / 1000
+
+        # Cap duration
+        if duration_s > max_duration_per_sample:
+            end_ms = start_ms + int(max_duration_per_sample * 1000)
+
+        selected.append({
+            'start': start_ms / 1000,  # Convert to seconds
+            'end': end_ms / 1000,
+            'text': utt.get('text', '')[:50]  # Preview text
+        })
+
+    if not selected:
+        return False, "No samples selected"
+
+    # Build ffmpeg filter_complex
+    # Format: [0]atrim=start=X:end=Y,asetpts=PTS-STARTPTS[aN];...
+    # Then: [a1][silence][a2][silence]...concat
+    filter_parts = []
+    concat_inputs = []
+
+    for i, sample in enumerate(selected):
+        label = f"a{i}"
+        filter_parts.append(
+            f"[0]atrim=start={sample['start']:.3f}:end={sample['end']:.3f},"
+            f"asetpts=PTS-STARTPTS[{label}]"
+        )
+        concat_inputs.append(f"[{label}]")
+
+        # Add silence between samples (except after last)
+        if i < len(selected) - 1 and silence_gap > 0:
+            silence_label = f"s{i}"
+            # Generate silence using anullsrc
+            filter_parts.append(
+                f"anullsrc=r=44100:cl=stereo,atrim=0:{silence_gap:.2f}[{silence_label}]"
+            )
+            concat_inputs.append(f"[{silence_label}]")
+
+    # Concat all segments
+    n_segments = len(concat_inputs)
+    filter_parts.append(
+        f"{''.join(concat_inputs)}concat=n={n_segments}:v=0:a=1[out]"
+    )
+
+    filter_complex = ';'.join(filter_parts)
+
+    # Build ffmpeg command
+    cmd = [
+        ffmpeg,
+        '-i', audio_file,
+        '-filter_complex', filter_complex,
+        '-map', '[out]',
+        '-y',  # Overwrite output
+        '-loglevel', 'error',
+        output_file
+    ]
+
+    try:
+        log_debug(args, f"Running ffmpeg with {len(selected)} samples")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            return False, f"ffmpeg failed: {error_msg}"
+
+        total_duration = sum(s['end'] - s['start'] for s in selected)
+        return True, f"Extracted {len(selected)} samples ({format_duration(int(total_duration * 1000))})"
+
+    except subprocess.TimeoutExpired:
+        return False, "ffmpeg timed out"
+    except Exception as e:
+        return False, f"ffmpeg error: {e}"
+
+
+def play_audio_file(
+    filepath: str,
+    player_name: str = None,
+    player_cmd: List[str] = None,
+    args=None
+) -> bool:
+    """
+    Play audio file with seeking-capable terminal player.
+
+    Args:
+        filepath: Path to audio file to play
+        player_name: Name of player (for display)
+        player_cmd: Command and args to run player
+        args: Arguments namespace for logging
+
+    Returns:
+        True if playback completed, False on error
+    """
+    if player_cmd is None:
+        player_name, player_cmd = find_audio_player()
+
+    if not player_cmd:
+        log_error(args, "No audio player found. Install mpv: sudo pacman -S mpv")
+        return False
+
+    # Build full command
+    cmd = player_cmd + [filepath]
+
+    # Show controls hint
+    if player_name == 'mpv':
+        hint = "mpv: ←/→ seek 5s, ↑/↓ seek 1m, space=pause, q=quit"
+    elif player_name == 'ffplay':
+        hint = "ffplay: ←/→ seek 10s, space=pause, q=quit"
+    else:
+        hint = f"{player_name}: use arrow keys to seek, q=quit"
+
+    print(f"→ Playing ({hint})", file=sys.stderr)
+
+    try:
+        # Run player, letting it take over terminal
+        result = subprocess.run(cmd, check=False)
+        return result.returncode == 0
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)  # Clean line after Ctrl+C
+        return True  # User interrupted, not an error
+    except Exception as e:
+        log_error(args, f"Playback failed: {e}")
+        return False
+
+
+def preview_speaker_audio(
+    audio_file: str,
+    json_data: dict,
+    speaker_label: str,
+    speaker_name: str = None,
+    max_samples: int = 10,
+    args=None
+) -> bool:
+    """
+    High-level function to preview audio samples for a speaker.
+
+    Extracts samples to temp file, plays them, then cleans up.
+
+    Args:
+        audio_file: Path to source audio file
+        json_data: Full AssemblyAI JSON data
+        speaker_label: Speaker label (e.g., 'A', 'B')
+        speaker_name: Display name for speaker (optional)
+        max_samples: Maximum samples to extract
+        args: Arguments namespace
+
+    Returns:
+        True if preview completed successfully
+    """
+    display_name = speaker_name or f"Speaker {speaker_label}"
+
+    # Get utterances for this speaker
+    utterances = get_speaker_utterances(json_data, speaker_label)
+
+    if not utterances:
+        print(f"No utterances found for {display_name}", file=sys.stderr)
+        return False
+
+    # Calculate stats
+    total_duration = sum(u.get('end', 0) - u.get('start', 0) for u in utterances)
+
+    print(f"\nExtracting samples for {display_name}...", file=sys.stderr)
+    print(f"  Found {len(utterances)} utterances ({format_duration(total_duration)})", file=sys.stderr)
+
+    # Find audio player first
+    player_name, player_cmd = find_audio_player()
+    if not player_cmd:
+        print("ERROR: No audio player found. Install mpv: sudo pacman -S mpv", file=sys.stderr)
+        return False
+
+    # Create temp file for extracted audio
+    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # Extract audio samples
+        success, message = extract_speaker_audio(
+            audio_file,
+            utterances,
+            tmp_path,
+            max_samples=max_samples,
+            args=args
+        )
+
+        if not success:
+            print(f"ERROR: {message}", file=sys.stderr)
+            return False
+
+        print(f"  {message}", file=sys.stderr)
+
+        # Play the extracted audio
+        return play_audio_file(tmp_path, player_name, player_cmd, args)
+
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------
 # Core JSON Traversal Functions
 # ----------------------------------------------------------------------
 
@@ -471,7 +937,8 @@ def detect_speakers_llm(
     transcript_sample: str,
     detected_labels: List[str],
     endpoint: Optional[str] = None,
-    args=None
+    args=None,
+    input_json: Optional[str] = None
 ):
     """
     Detect speaker names using LLM via Instructor.
@@ -482,6 +949,7 @@ def detect_speakers_llm(
         detected_labels: List of detected speaker labels (e.g., ['A', 'B'])
         endpoint: Optional custom endpoint URL
         args: Arguments namespace (for logging)
+        input_json: Path to input JSON file (for loading .about.md context)
 
     Returns:
         SpeakerDetection object with suggested speaker names
@@ -512,15 +980,63 @@ DETECTED SPEAKERS: {', '.join(detected_labels)}
 
 Your task is to create a mapping of each detected speaker label to their actual name or professional role, along with contextual information to help identify them.
 
+CRITICAL WARNING - Avoid Address Confusion:
+When someone says a name in their utterance, they are usually ADDRESSING that person, NOT identifying themselves.
+- "Alice, what do you think?" → Speaker is NOT Alice, they are talking TO Alice
+- "Bob, I agree with you" → Speaker is NOT Bob, they are responding TO Bob
+- "Thanks John for joining us" → Speaker is NOT John, they are welcoming John
+Pay careful attention to WHO is being addressed vs WHO is speaking. The name mentioned is typically the listener, not the speaker.
+
 Look for:
-- Direct name mentions (e.g., "Hi Alice", "Thanks Bob")
-- Introductions ("I'm...", "My name is...")
+- Direct name mentions - but remember: the name mentioned is usually the ADDRESSEE, not the speaker
+- Introductions ("I'm...", "My name is...") - these DO identify the speaker
 - Self-references using third person ("Alice is happy", "Bob appreciates")
 - Professional roles if names aren't mentioned (Host, Guest, Expert, Interviewer)
 - Topics they discussed (AI, research, product features, etc.)
 - Their role in the conversation (asking questions, explaining, presenting, etc.)
 - Keywords, adjectives, or characteristics that identify them
+"""
 
+    # Initialize context variables
+    dir_context = None
+    about_content = None
+
+    # Add directory context if available (STT-IN-BATCH.CONTEXT.md)
+    # This is general context for all files in the directory tree
+    if input_json:
+        dir_context, dir_context_path = get_directory_context_content(input_json)
+        if dir_context:
+            if not getattr(args, 'quiet', False):
+                print(f"Using directory context from: {dir_context_path}", file=sys.stderr)
+            log_debug(args, f"Directory context ({len(dir_context)} chars)")
+            prompt += f"""
+DIRECTORY CONTEXT (applies to all files in this project):
+{dir_context}
+
+"""
+
+    # Add file-specific about context if available
+    # This is specific to this particular audio file
+    if input_json:
+        about_content = get_about_file_content(input_json)
+        if about_content:
+            about_path = get_about_file_path(input_json)
+            # Always inform user (not just in verbose mode) since this affects results
+            if not getattr(args, 'quiet', False):
+                print(f"Using file context from: {about_path}", file=sys.stderr)
+            log_debug(args, f"About file content ({len(about_content)} chars)")
+            prompt += f"""
+FILE-SPECIFIC CONTEXT (for this audio file):
+{about_content}
+
+"""
+
+    # Add instruction if any context was provided
+    if dir_context or about_content:
+        prompt += """Use the above context to help identify speakers. The context may contain speaker names, roles, topics discussed, or other identifying information.
+"""
+
+    prompt += f"""
 TRANSCRIPT SAMPLE:
 {transcript_sample}
 
@@ -622,7 +1138,8 @@ def handle_llm_detection(args, json_data, detected_speakers):
                 ai_suggestions,
                 speaker_contexts,
                 args.input_json,
-                args
+                args,
+                json_data=json_data
             )
         except (FileNotFoundError, ValueError) as e:
             log_warning(args, f"Failed to load suggestions file: {e}")
@@ -657,7 +1174,8 @@ def handle_llm_detection(args, json_data, detected_speakers):
             transcript_sample,
             list(detected_speakers),
             endpoint=args.llm_endpoint,
-            args=args
+            args=args,
+            input_json=args.input_json
         )
 
         log_info(args, f"LLM confidence: {detection_result.confidence}")
@@ -690,7 +1208,8 @@ def handle_llm_detection(args, json_data, detected_speakers):
                 detection_result.speakers,
                 speaker_contexts,
                 args.input_json,
-                args
+                args,
+                json_data=json_data
             )
 
         # Auto mode: use LLM suggestions directly
@@ -772,6 +1291,10 @@ def expand_command_placeholders(command: str, input_json: str) -> str:
         '{suggestions}': f'{base_audio}.assemblyai.mapping-suggestions.json',
         '{suggestions-json}': f'{base_audio}.assemblyai.mapping-suggestions.json',
         '{sj}': f'{base_audio}.assemblyai.mapping-suggestions.json',
+
+        # About file
+        '{about}': f'{base_audio}.about.md',
+        '{ab}': f'{base_audio}.about.md',
     }
 
     # Replace placeholders with quoted paths
@@ -867,7 +1390,10 @@ def show_command_help():
 Special commands:
   skip              - Abort mapping (can rerun later)
   help              - Show this help message
-  play              - Play audio file (alias for: !play {audio})
+  play              - Play entire audio file (alias for: !play {audio})
+  speak             - Preview audio samples for CURRENT speaker being prompted
+  speak A           - Preview audio samples for speaker A (or any label)
+  about             - Edit about file with context (opens $EDITOR)
   !<command>        - Execute shell command with placeholders
 
 Placeholders (use in ! commands):
@@ -877,13 +1403,21 @@ Placeholders (use in ! commands):
   {mapped-text} {mt} - Mapped transcript (output)
   {mapped-json} {mj} - Mapped JSON (output)
   {suggestions} {sj} - Speaker suggestions (.mapping-suggestions.json)
+  {about} {ab}      - About file with context (.about.md)
 
 Examples:
-  !play {audio}           - Play the audio file
-  !less {text}            - View transcript
-  !jq .speakers {json}    - Inspect speakers in JSON
-  !head -50 {text}        - Show first 50 lines
-  !grep "Alice" {text}    - Search for keyword
+  speak               - Hear samples of current speaker
+  speak B             - Hear samples of speaker B
+  !play {audio}       - Play the entire audio file
+  !less {text}        - View transcript
+  !jq .speakers {json} - Inspect speakers in JSON
+  !head -50 {text}    - Show first 50 lines
+  !grep "Alice" {text} - Search for keyword
+  about               - Edit about file to add speaker context
+
+About File (.about.md):
+  Create {audiofile}.about.md with speaker names, roles, and context.
+  This context is passed to the LLM for improved speaker detection.
 
 Press Enter to accept AI suggestion, or type a name to override.
 """
@@ -895,7 +1429,8 @@ def prompt_interactive_with_suggestions(
     ai_suggestions: dict,
     speaker_contexts: dict,
     input_json: str,
-    args
+    args,
+    json_data: dict = None
 ) -> dict:
     """
     Interactive prompts with AI suggestions as defaults.
@@ -906,10 +1441,14 @@ def prompt_interactive_with_suggestions(
         speaker_contexts: Dict of speaker labels to context information
         input_json: Path to input JSON file (for command execution)
         args: Arguments namespace
+        json_data: Full JSON data (for audio preview feature)
 
     Returns:
         Final speaker mapping dict, or None if user chooses to skip
     """
+    # Derive audio file path for speak command
+    audio_file = get_audio_file_path(input_json)
+
     # First, show ALL AI-detected mappings upfront for context
     print("\n=== AI-Detected Speaker Mappings ===", file=sys.stderr)
     for speaker in sorted(detected_speakers):
@@ -922,7 +1461,7 @@ def prompt_interactive_with_suggestions(
 
     # Then prompt for confirmation/override
     print("\n=== Review and Confirm ===", file=sys.stderr)
-    print("  Enter=accept | name=override | skip=abort | help=commands | play=audio", file=sys.stderr)
+    print("  Enter=accept | name=override | skip=abort | speak=hear speaker | help=commands", file=sys.stderr)
     print("  !cmd: run shell commands with {a}udio {t}ext {j}son {mt}apped-text placeholders", file=sys.stderr)
     print("", file=sys.stderr)
 
@@ -961,6 +1500,56 @@ def prompt_interactive_with_suggestions(
                 except KeyboardInterrupt:
                     # User pressed Ctrl+C during command execution - just continue prompting
                     print("", file=sys.stderr)
+                continue  # Re-prompt for same speaker
+
+            elif user_input.lower().startswith('speak'):
+                # Preview audio samples for a speaker
+                if json_data is None:
+                    print("ERROR: Audio preview not available (no JSON data)", file=sys.stderr)
+                    continue
+
+                # Parse speak command: "speak" or "speak A"
+                parts = user_input.split(None, 1)
+                if len(parts) > 1:
+                    # Specific speaker requested
+                    target_speaker = parts[1].strip()
+                    if target_speaker not in detected_speakers:
+                        print(f"Unknown speaker: {target_speaker}", file=sys.stderr)
+                        print(f"Available: {', '.join(sorted(detected_speakers))}", file=sys.stderr)
+                        continue
+                else:
+                    # Default to current speaker being prompted
+                    target_speaker = speaker
+
+                # Get suggested name for display
+                target_name = ai_suggestions.get(target_speaker, f"Speaker {target_speaker}")
+
+                try:
+                    preview_speaker_audio(
+                        audio_file,
+                        json_data,
+                        target_speaker,
+                        speaker_name=target_name,
+                        args=args
+                    )
+                except KeyboardInterrupt:
+                    print("", file=sys.stderr)
+                print("", file=sys.stderr)
+                continue  # Re-prompt for same speaker
+
+            elif user_input.lower() == 'about':
+                # Open about file in editor for adding speaker context
+                about_path = get_about_file_path(input_json)
+                editor = os.environ.get('EDITOR', os.environ.get('VISUAL', 'nano'))
+                try:
+                    import subprocess
+                    print(f"\n→ Opening {about_path} in {editor}...", file=sys.stderr)
+                    subprocess.run([editor, about_path], check=False)
+                    if os.path.exists(about_path):
+                        print(f"✓ About file saved: {about_path}", file=sys.stderr)
+                    print("", file=sys.stderr)
+                except Exception as e:
+                    log_error(args, f"Failed to open editor: {e}")
                 continue  # Re-prompt for same speaker
 
             elif user_input.startswith('!'):
@@ -1411,6 +2000,23 @@ Shortcut Examples:
   %(prog)s --llm-detect smollm2:1.7b audio.assemblyai.json       # Best small model
   %(prog)s --llm-detect qwen2.5-coder:1.5b audio.assemblyai.json # Best small coder
   %(prog)s --llm-detect llama3.2:1b audio.assemblyai.json        # Ultra-fast local
+
+Audio Preview Features (requires ffmpeg + mpv/ffplay/mplayer):
+  Interactive 'speak' command:
+    During --llm-interactive mapping, type 'speak' to hear the current speaker
+    or 'speak A' to hear any speaker. Uses arrow keys to seek in playback.
+
+  Preview a speaker:
+    %(prog)s --preview-speaker A audio.assemblyai.json
+    %(prog)s --preview-speaker B --max-samples 5 audio.assemblyai.json
+
+  Extract speaker audio to file:
+    %(prog)s --extract-speaker A audio.assemblyai.json
+    %(prog)s --extract-speaker A -o alice_samples.mp3 audio.assemblyai.json
+
+  Verify/review existing mappings:
+    %(prog)s --verify audio.assemblyai.mapped.json
+    Plays each speaker's audio and prompts to confirm or change names.
         """
     )
 
@@ -1503,6 +2109,31 @@ Shortcut Examples:
         help='Output speaker mapping as JSON to stdout instead of files (for benchmarking)'
     )
 
+    # Audio preview features
+    parser.add_argument(
+        '--verify',
+        action='store_true',
+        help='Verify/review existing speaker mappings with audio preview. '
+             'Plays audio samples for each speaker and allows name corrections.'
+    )
+    parser.add_argument(
+        '--preview-speaker',
+        metavar='LABEL',
+        help='Preview audio samples for a specific speaker label (e.g., A, B) and exit'
+    )
+    parser.add_argument(
+        '--extract-speaker',
+        metavar='LABEL',
+        help='Extract audio samples for a speaker to a file (use with -o for output path)'
+    )
+    parser.add_argument(
+        '--max-samples',
+        type=int,
+        default=10,
+        metavar='N',
+        help='Maximum number of audio samples to extract/preview (default: 10)'
+    )
+
     # Logging
     parser.add_argument(
         '-v', '--verbose',
@@ -1525,6 +2156,138 @@ Shortcut Examples:
     )
 
     return parser.parse_args()
+
+
+# ----------------------------------------------------------------------
+# Verify Mode
+# ----------------------------------------------------------------------
+
+def run_verify_mode(args, json_data: dict, current_mappings: dict = None):
+    """
+    Interactive verification of speaker mappings with audio preview.
+
+    For each speaker, plays audio samples and asks user to confirm or change the name.
+
+    Args:
+        args: Parsed arguments
+        json_data: Full AssemblyAI JSON data
+        current_mappings: Existing speaker name mappings (from mapped JSON)
+
+    Returns:
+        Updated speaker mapping dict, or None if user aborts
+    """
+    audio_file = get_audio_file_path(args.input_json)
+
+    if not os.path.exists(audio_file):
+        log_error(args, f"Audio file not found: {audio_file}")
+        return None
+
+    # Get all speakers from JSON
+    detected_speakers = detect_speakers_in_json(json_data)
+
+    if not detected_speakers:
+        log_error(args, "No speakers found in JSON")
+        return None
+
+    # If no current mappings provided, speakers are their own names
+    if current_mappings is None:
+        current_mappings = {s: s for s in detected_speakers}
+
+    # Build reverse mapping (name -> original label) for display
+    # This handles mapped JSON where speakers are already names
+    original_labels = {}
+    for speaker in detected_speakers:
+        # Check if this speaker value is a mapped name or an original label
+        if speaker in current_mappings.values():
+            # It's a mapped name, find original label
+            for label, name in current_mappings.items():
+                if name == speaker:
+                    original_labels[speaker] = label
+                    break
+        else:
+            original_labels[speaker] = speaker
+
+    print("\n=== Speaker Verification Mode ===", file=sys.stderr)
+    print("Review each speaker with audio samples. Confirm or change names.", file=sys.stderr)
+    print("Commands: [Enter]=confirm, [name]=change, [r]=replay, [s]=skip speaker, [q]=quit", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    updated_map = {}
+    speakers_list = sorted(detected_speakers)
+
+    for i, speaker in enumerate(speakers_list, 1):
+        original_label = original_labels.get(speaker, speaker)
+        current_name = speaker  # In mapped JSON, speaker IS the name
+
+        print(f"\n[{i}/{len(speakers_list)}] {current_name}", file=sys.stderr)
+        if original_label != current_name:
+            print(f"  (originally: {original_label})", file=sys.stderr)
+
+        # Play audio samples
+        try:
+            preview_speaker_audio(
+                audio_file,
+                json_data,
+                speaker,  # Use current speaker value (might be name or label)
+                speaker_name=current_name,
+                max_samples=args.max_samples,
+                args=args
+            )
+        except KeyboardInterrupt:
+            print("", file=sys.stderr)
+
+        # Prompt for confirmation/change
+        while True:
+            try:
+                prompt = f"  Confirm [{current_name}]: "
+                user_input = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n\nAborted.", file=sys.stderr)
+                return None
+
+            if user_input.lower() == 'q':
+                print("\nQuitting verification.", file=sys.stderr)
+                return None
+
+            elif user_input.lower() == 's':
+                # Skip this speaker, keep current name
+                updated_map[original_label] = current_name
+                log_info(args, f"Skipped: {original_label} → {current_name}")
+                break
+
+            elif user_input.lower() == 'r':
+                # Replay audio
+                try:
+                    preview_speaker_audio(
+                        audio_file,
+                        json_data,
+                        speaker,
+                        speaker_name=current_name,
+                        max_samples=args.max_samples,
+                        args=args
+                    )
+                except KeyboardInterrupt:
+                    print("", file=sys.stderr)
+                continue
+
+            elif user_input == '':
+                # Confirm current name
+                updated_map[original_label] = current_name
+                print(f"  ✓ Confirmed: {current_name}", file=sys.stderr)
+                break
+
+            else:
+                # User provided new name
+                updated_map[original_label] = user_input
+                print(f"  ✓ Changed: {current_name} → {user_input}", file=sys.stderr)
+                break
+
+    print("\n=== Verification Complete ===", file=sys.stderr)
+    print("Updated mappings:", file=sys.stderr)
+    for label, name in sorted(updated_map.items()):
+        print(f"  {label} → {name}", file=sys.stderr)
+
+    return updated_map
 
 
 # ----------------------------------------------------------------------
@@ -1562,6 +2325,117 @@ def main():
         print(f"Detected speakers: {', '.join(sorted(detected_speakers))}")
         return
 
+    # Preview speaker audio mode
+    if args.preview_speaker:
+        speaker_label = args.preview_speaker
+        if speaker_label not in detected_speakers:
+            log_error(args, f"Unknown speaker: {speaker_label}")
+            print(f"Available speakers: {', '.join(sorted(detected_speakers))}", file=sys.stderr)
+            sys.exit(1)
+
+        audio_file = get_audio_file_path(args.input_json)
+        if not os.path.exists(audio_file):
+            log_error(args, f"Audio file not found: {audio_file}")
+            sys.exit(1)
+
+        success = preview_speaker_audio(
+            audio_file,
+            json_data,
+            speaker_label,
+            max_samples=args.max_samples,
+            args=args
+        )
+        sys.exit(0 if success else 1)
+
+    # Extract speaker audio mode
+    if args.extract_speaker:
+        speaker_label = args.extract_speaker
+        if speaker_label not in detected_speakers:
+            log_error(args, f"Unknown speaker: {speaker_label}")
+            print(f"Available speakers: {', '.join(sorted(detected_speakers))}", file=sys.stderr)
+            sys.exit(1)
+
+        audio_file = get_audio_file_path(args.input_json)
+        if not os.path.exists(audio_file):
+            log_error(args, f"Audio file not found: {audio_file}")
+            sys.exit(1)
+
+        # Determine output path
+        if args.output:
+            output_path = args.output
+        else:
+            base = get_audio_file_path(args.input_json)
+            output_path = f"{base}.speaker_{speaker_label}.mp3"
+
+        # Check if output exists
+        if os.path.exists(output_path) and not args.force:
+            log_error(args, f"Output file exists: {output_path}")
+            log_error(args, "Use -f/--force to overwrite")
+            sys.exit(1)
+
+        # Get utterances and extract
+        utterances = get_speaker_utterances(json_data, speaker_label)
+        if not utterances:
+            log_error(args, f"No utterances found for speaker {speaker_label}")
+            sys.exit(1)
+
+        print(f"Extracting audio for speaker {speaker_label}...", file=sys.stderr)
+        success, message = extract_speaker_audio(
+            audio_file,
+            utterances,
+            output_path,
+            max_samples=args.max_samples,
+            args=args
+        )
+
+        if success:
+            print(f"✓ {message}", file=sys.stderr)
+            print(f"Saved to: {output_path}", file=sys.stderr)
+            sys.exit(0)
+        else:
+            log_error(args, message)
+            sys.exit(1)
+
+    # Verify mode - review existing speaker mappings with audio preview
+    if args.verify:
+        updated_map = run_verify_mode(args, json_data)
+        if updated_map:
+            # Ask if user wants to save changes
+            try:
+                save_prompt = input("\nSave updated mappings? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nNot saving.", file=sys.stderr)
+                return
+
+            if save_prompt == 'y':
+                # Apply mappings and save
+                mapped_json = replace_speakers_recursive(json_data, updated_map)
+                output_base = generate_output_path(args.input_json, extension='')
+                json_output = f"{output_base}.json"
+                txt_output = f"{output_base}.txt"
+
+                # Check for existing files
+                if not args.force:
+                    existing = []
+                    if os.path.exists(json_output):
+                        existing.append(json_output)
+                    if os.path.exists(txt_output):
+                        existing.append(txt_output)
+                    if existing:
+                        log_error(args, f"Output file(s) already exist: {', '.join(existing)}")
+                        log_error(args, "Use -f/--force to overwrite")
+                        return
+
+                write_json(json_output, mapped_json, args)
+                txt_content = generate_txt_from_json(mapped_json, args)
+                if txt_content:
+                    write_txt(txt_output, txt_content, args)
+
+                print(f"✓ Saved: {json_output}, {txt_output}", file=sys.stderr)
+            else:
+                print("Changes not saved.", file=sys.stderr)
+        return
+
     # Generate-suggestions-only mode
     if args.generate_suggestions_only:
         suggestions_path = get_suggestions_file_path(args.input_json)
@@ -1593,7 +2467,8 @@ def main():
                 transcript_sample,
                 list(detected_speakers),
                 endpoint=args.llm_endpoint,
-                args=args
+                args=args,
+                input_json=args.input_json
             )
 
             # Save suggestions to file

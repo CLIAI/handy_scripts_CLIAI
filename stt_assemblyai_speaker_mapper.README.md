@@ -108,10 +108,15 @@ A => Alice Anderson
 B => Bob Smith
 C => Unknown
 
-=== Review and Confirm (press Enter to accept, or type to override) ===
+=== Review and Confirm ===
+  Enter=accept | name=override | skip=abort | help=commands | play=audio
+  about=edit context file | !cmd: run shell commands
+
 A => [Alice Anderson]: _               ← Press Enter to accept
 B => [Bob Smith]: Robert               ← Type to override
-C => [Unknown]: Charlie Chaplin        ← AI unsure, provide name
+C => [Unknown]: about                  ← Opens editor to add context
+→ Opening audio.about.md in nano...
+C => [Unknown]: Charlie Chaplin        ← Now provide name
 ```
 
 #### 3. Fallback Mode
@@ -250,6 +255,133 @@ It returns structured suggestions with confidence levels:
 * **High**: Names explicitly mentioned
 * **Medium**: Strong contextual clues
 * **Low**: Weak inference (often returns "Unknown")
+
+## Context Files for Speaker Detection
+
+Two types of context files can improve LLM speaker detection:
+
+1. **Directory context** (`SPEAKER.CONTEXT.md`) - Applies to all audio files in a directory tree
+2. **File-specific context** (`{audiofile}.about.md`) - Applies to a single audio file
+
+### Directory Context File (SPEAKER.CONTEXT.md)
+
+Create a `SPEAKER.CONTEXT.md` file in any directory. It applies to all audio files in that directory and subdirectories (similar to `.gitignore`).
+
+**Search behavior:**
+
+* Searches in the audio file's directory first
+* Walks up parent directories until found
+* Searches both original path AND resolved symlink path
+
+**Example structure:**
+
+```
+project/
+├── SPEAKER.CONTEXT.md    ← Applies to all files below
+├── meetings/
+│   ├── meeting1.mp3
+│   └── meeting2.mp3
+└── interviews/
+    ├── SPEAKER.CONTEXT.md  ← Overrides for this subdir
+    └── interview1.mp3
+```
+
+**Example content:**
+
+```markdown
+# Project Context
+
+This project contains recordings from Company X.
+
+Common speakers:
+* Greg Williams - CEO, leads most meetings
+* Alice Chen - CTO, discusses technical topics
+* Bob Smith - Sales Director, client-facing calls
+
+Topics: product roadmap, engineering, sales pipeline
+```
+
+## About Files for Speaker Context
+
+Provide file-specific context with `.about.md` files.
+
+### About File Specification
+
+* **Path**: `{audiofile}.about.md` (e.g., `meeting.mp3.about.md`)
+* **Purpose**: Provide context about speakers, roles, and topics
+* **Format**: Free-form markdown
+
+### Creating About Files
+
+#### Via Interactive Command
+
+During interactive mode, type `about` to open the file in your editor:
+
+```
+=== Review and Confirm ===
+A => [Unknown]: about
+
+→ Opening meeting.mp3.about.md in nano...
+✓ About file saved: meeting.mp3.about.md
+
+A => [Unknown]:
+```
+
+The file is opened in `$EDITOR` (or `$VISUAL`, or `nano` as fallback).
+
+#### Manually
+
+Create the file before running speaker detection:
+
+```bash
+cat > meeting.mp3.about.md << 'EOF'
+## Meeting Context
+
+This is a product planning meeting between:
+
+* Alice Chen - Product Manager, leads the discussion
+* Bob Smith - Engineering Lead, discusses technical feasibility
+* Carol Davis - Designer, presents UI mockups
+
+Topics covered: Q1 roadmap, feature prioritization, design review
+EOF
+```
+
+### How About Files Enhance Detection
+
+When an `.about.md` file exists:
+
+1. Content is automatically loaded and passed to the LLM prompt
+2. LLM uses this context alongside transcript analysis
+3. Significantly improves accuracy when names aren't mentioned in audio
+
+**Example prompt addition:**
+
+```
+CONTEXT PROVIDED BY USER:
+## Meeting Context
+
+This is a product planning meeting between:
+* Alice Chen - Product Manager
+* Bob Smith - Engineering Lead
+
+Use the above context to help identify speakers...
+```
+
+### {about} Placeholder
+
+Use in interactive `!commands`:
+
+```bash
+!cat {about}        # View about file content
+!less {about}       # Page through about file
+!$EDITOR {about}    # Edit about file
+```
+
+Placeholders:
+
+* `{about}` - Full path to about file
+* `{ab}` - Short alias
 
 ## Workflow Integration
 
