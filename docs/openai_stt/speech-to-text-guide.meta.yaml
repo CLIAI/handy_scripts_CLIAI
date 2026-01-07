@@ -1,0 +1,7 @@
+url: "https://platform.openai.com/docs/guides/speech-to-text"
+title: "Speech to text | OpenAI API"
+fetched_at: "2026-01-07T01:11:08+01:00"
+description: "Complete guide to OpenAI Speech-to-Text API including Whisper and GPT-4o models, parameters, and usage examples"
+additional_urls:
+  - "https://platform.openai.com/docs/api-reference/audio/createTranscription"
+  - "https://platform.openai.com/docs/api-reference/audio/createTranslation"

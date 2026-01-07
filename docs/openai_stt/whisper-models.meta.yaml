@@ -1,0 +1,7 @@
+url: "https://github.com/openai/whisper"
+title: "OpenAI Whisper - Robust Speech Recognition via Large-Scale Weak Supervision"
+fetched_at: "2026-01-07T01:11:08+01:00"
+description: "Whisper model specifications including sizes, parameters, VRAM requirements, and language support"
+additional_urls:
+  - "https://platform.openai.com/docs/models/whisper-1"
+  - "https://openai.com/index/whisper/"

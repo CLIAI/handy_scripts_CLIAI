@@ -29,6 +29,7 @@ run_eval() {
 
 run_eval "stt_assemblyai" "${SCRIPT_DIR}/run_stt_assemblyai.py"
 run_eval "stt_speechmatics" "${SCRIPT_DIR}/run_stt_speechmatics.py"
+run_eval "stt_openai" "${SCRIPT_DIR}/run_stt_openai.py"
 
 echo "All evals: total=${run_total} passed=${run_passed} failed=${run_failed} skipped=${run_skipped}"
 
