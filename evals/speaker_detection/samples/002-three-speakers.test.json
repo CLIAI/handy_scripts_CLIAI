@@ -1,0 +1,20 @@
+{
+  "id": "002-three-speakers",
+  "description": "Three-speaker meeting (alice, bob, charlie)",
+  "speakers": {
+    "alice": {
+      "enrollment_audio": "audio/enroll_alice.wav",
+      "voice": "en-us"
+    },
+    "bob": {
+      "enrollment_audio": "audio/enroll_bob.wav",
+      "voice": "en-gb"
+    },
+    "charlie": {
+      "enrollment_audio": "audio/enroll_charlie.wav",
+      "voice": "en-au"
+    }
+  },
+  "test_audio": "audio/test_002-three-speakers.wav",
+  "expected_speakers": ["alice", "bob", "charlie"]
+}

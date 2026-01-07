@@ -123,6 +123,101 @@ REGIONS = {
 
 
 # ----------------------------------------------------------------------
+# Speaker identification integration
+# ----------------------------------------------------------------------
+
+def load_enrolled_speakers(tag: str, context: str = "default", args=None):
+    """
+    Load enrolled speakers from speaker_detection database.
+
+    Args:
+        tag: Tag to filter speakers
+        context: Name context to use for labels
+        args: For logging
+
+    Returns:
+        List of speaker configs for Speechmatics API, or empty list
+    """
+    try:
+        # Import from speaker_detection module
+        import sys
+        from pathlib import Path
+
+        # Add current directory to path if needed
+        script_dir = Path(__file__).parent
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+
+        # Try to import speaker_detection functions
+        try:
+            # Read speaker database directly (avoid circular import)
+            import os
+            db_dir = Path(os.environ.get(
+                "SPEAKERS_EMBEDDINGS_DIR",
+                os.path.expanduser("~/.config/speakers_embeddings")
+            )) / "db"
+
+            if not db_dir.exists():
+                log_info(args, f"Speaker database not found: {db_dir}")
+                return []
+
+            speakers = []
+            for path in db_dir.glob("*.json"):
+                try:
+                    with open(path) as f:
+                        speakers.append(json.load(f))
+                except (json.JSONDecodeError, IOError):
+                    continue
+
+            # Filter by tag
+            tag_set = set(t.strip() for t in tag.split(","))
+            filtered = [
+                s for s in speakers
+                if tag_set & set(s.get("tags", []))
+            ]
+
+            if not filtered:
+                log_info(args, f"No speakers found with tag(s): {tag}")
+                return []
+
+            # Build speaker configs
+            speakers_config = []
+            for speaker in filtered:
+                embs = speaker.get("embeddings", {}).get("speechmatics", [])
+                if not embs:
+                    continue
+
+                # Collect all identifiers
+                identifiers = []
+                for emb in embs:
+                    if emb.get("external_id"):
+                        identifiers.append(emb["external_id"])
+                    identifiers.extend(emb.get("all_identifiers", []))
+
+                if identifiers:
+                    # Get name for the specified context
+                    name = speaker.get("names", {}).get(
+                        context,
+                        speaker.get("names", {}).get("default", speaker["id"])
+                    )
+                    speakers_config.append({
+                        "label": name,
+                        "speaker_identifiers": list(set(identifiers))[:50],  # API max
+                    })
+
+            log_info(args, f"Loaded {len(speakers_config)} enrolled speakers for identification")
+            return speakers_config
+
+        except Exception as e:
+            log_warning(args, f"Error loading speakers: {e}")
+            return []
+
+    except Exception as e:
+        log_warning(args, f"Speaker identification not available: {e}")
+        return []
+
+
+# ----------------------------------------------------------------------
 # API functions
 # ----------------------------------------------------------------------
 
@@ -162,6 +257,14 @@ def create_job(api_token, audio_input, args):
             speaker_config["max_speakers"] = args.max_speakers
         if args.speaker_sensitivity is not None:
             speaker_config["speaker_sensitivity"] = args.speaker_sensitivity
+
+        # Add enrolled speakers for identification
+        speakers_tag = getattr(args, 'speakers_tag', None)
+        if speakers_tag:
+            speakers_context = getattr(args, 'speakers_context', 'default')
+            enrolled = load_enrolled_speakers(speakers_tag, speakers_context, args)
+            if enrolled:
+                speaker_config["speakers"] = enrolled
 
         if speaker_config:
             transcription_config["speaker_diarization_config"] = speaker_config
@@ -512,11 +615,13 @@ Examples:
   %(prog)s -d --max-speakers 3 audio.mp3   # Limit to 3 speakers
   %(prog)s -l de audio.mp3                 # German transcription
   %(prog)s -R us -d audio.mp3              # US region with diarisation
+  %(prog)s -d --speakers-tag podcast audio.mp3  # Use enrolled speakers
 
 Environment:
-  SPEECHMATICS_API_KEY    Your Speechmatics API key (required)
-  STT_META_MESSAGE_DISABLE=1  Disable META warning message
-  STT_META_MESSAGE="..."      Custom META message
+  SPEECHMATICS_API_KEY       Your Speechmatics API key (required)
+  SPEAKERS_EMBEDDINGS_DIR    Speaker database location (for --speakers-tag)
+  STT_META_MESSAGE_DISABLE=1 Disable META warning message
+  STT_META_MESSAGE="..."     Custom META message
 """
     )
     parser.add_argument('audio_input', type=str,
@@ -544,6 +649,10 @@ Environment:
     parser.add_argument('--no-meta-message', '--disable-meta-message', action='store_true',
                         dest='no_meta_message',
                         help='Disable META warning message about transcription errors')
+    parser.add_argument('--speakers-tag', metavar='TAG',
+                        help='Use enrolled speakers from speaker_detection with this tag')
+    parser.add_argument('--speakers-context', metavar='CTX', default='default',
+                        help='Name context to use for speaker labels (default: default)')
     return parser
 
 

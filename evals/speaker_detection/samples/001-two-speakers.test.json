@@ -1,0 +1,16 @@
+{
+  "id": "001-two-speakers",
+  "description": "Two-speaker conversation (alice and bob)",
+  "speakers": {
+    "alice": {
+      "enrollment_audio": "audio/enroll_alice.wav",
+      "voice": "en-us"
+    },
+    "bob": {
+      "enrollment_audio": "audio/enroll_bob.wav",
+      "voice": "en-gb"
+    }
+  },
+  "test_audio": "audio/test_001-two-speakers.wav",
+  "expected_speakers": ["alice", "bob"]
+}

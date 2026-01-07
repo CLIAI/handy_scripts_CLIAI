@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+"""
+speaker_detection - Universal speaker detection and embedding management CLI
+
+Manage speaker profiles with embeddings across multiple backends (Speechmatics,
+PyAnnote, SpeechBrain) with jq-queryable JSON storage.
+
+Usage:
+    # Speaker management
+    speaker_detection add <id> --name "Name" [--tag tag] [--metadata k=v]
+    speaker_detection list [--tags tag1,tag2] [--format json|table|ids]
+    speaker_detection show <id> [--format json|yaml]
+    speaker_detection update <id> [options]
+    speaker_detection delete <id> [--force]
+
+    # Embedding management
+    speaker_detection enroll <id> <audio> [--backend speechmatics] [--segments start:end,...]
+    speaker_detection enroll <id> <audio> --from-transcript file.json --speaker-label A
+    speaker_detection embeddings <id> [--backend backend]
+    speaker_detection remove-embedding <id> <emb-id>
+
+    # Detection/Identification
+    speaker_detection identify <audio> [--backend backend] [--tags tags]
+    speaker_detection verify <id> <audio> [--threshold 0.354]
+
+    # Export/Integration
+    speaker_detection export [--tags tags] [--context ctx] [--format json|speechmatics]
+    speaker_detection query '<jq-expression>'
+
+Environment:
+    SPEAKERS_EMBEDDINGS_DIR - Database location (default: ~/.config/speakers_embeddings)
+    SPEAKER_DETECTION_BACKEND - Default backend (default: speechmatics)
+    SPEECHMATICS_API_KEY - Required for speechmatics backend
+"""
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+
+DEFAULT_DB_DIR = os.path.expanduser("~/.config/speakers_embeddings")
+SCHEMA_VERSION = 1
+
+
+def get_db_dir() -> Path:
+    """Get the speakers embeddings directory."""
+    return Path(os.environ.get("SPEAKERS_EMBEDDINGS_DIR", DEFAULT_DB_DIR))
+
+
+def get_speakers_db_path() -> Path:
+    """Get the speakers database directory."""
+    return get_db_dir() / "db"
+
+
+def get_embeddings_path() -> Path:
+    """Get the embeddings storage directory."""
+    return get_db_dir() / "embeddings"
+
+
+def get_config_path() -> Path:
+    """Get the config file path."""
+    return get_db_dir() / "config.json"
+
+
+def ensure_dirs():
+    """Ensure all required directories exist."""
+    get_speakers_db_path().mkdir(parents=True, exist_ok=True)
+    get_embeddings_path().mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------
+# Speaker Profile Schema
+# ----------------------------------------------------------------------
+
+def create_speaker_profile(
+    speaker_id: str,
+    name: str,
+    name_contexts: Optional[Dict[str, str]] = None,
+    nicknames: Optional[List[str]] = None,
+    description: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create a new speaker profile with default values."""
+    now = datetime.now(timezone.utc).isoformat()
+
+    names = {"default": name}
+    if name_contexts:
+        names.update(name_contexts)
+
+    return {
+        "id": speaker_id,
+        "version": SCHEMA_VERSION,
+        "names": names,
+        "nicknames": nicknames or [],
+        "description": description or "",
+        "metadata": metadata or {},
+        "tags": list(set(tags)) if tags else [],
+        "embeddings": {},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def validate_speaker_id(speaker_id: str) -> bool:
+    """Validate speaker ID format (lowercase alphanumeric with hyphens/underscores)."""
+    import re
+    return bool(re.match(r"^[a-z0-9][a-z0-9_-]*$", speaker_id))
+
+
+def normalize_speaker_id(speaker_id: str) -> str:
+    """Normalize speaker ID to lowercase with hyphens."""
+    return speaker_id.lower().replace(" ", "-")
+
+
+# ----------------------------------------------------------------------
+# Storage Operations
+# ----------------------------------------------------------------------
+
+def get_speaker_path(speaker_id: str) -> Path:
+    """Get the path to a speaker's JSON file."""
+    return get_speakers_db_path() / f"{speaker_id}.json"
+
+
+def load_speaker(speaker_id: str) -> Optional[Dict[str, Any]]:
+    """Load a speaker profile from disk."""
+    path = get_speaker_path(speaker_id)
+    if not path.exists():
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_speaker(profile: Dict[str, Any]) -> None:
+    """Save a speaker profile to disk."""
+    ensure_dirs()
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    path = get_speaker_path(profile["id"])
+    with open(path, "w") as f:
+        json.dump(profile, f, indent=2, ensure_ascii=False)
+
+
+def delete_speaker_file(speaker_id: str) -> bool:
+    """Delete a speaker's JSON file."""
+    path = get_speaker_path(speaker_id)
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def list_all_speakers() -> List[Dict[str, Any]]:
+    """List all speaker profiles."""
+    speakers = []
+    db_path = get_speakers_db_path()
+    if not db_path.exists():
+        return speakers
+
+    for path in sorted(db_path.glob("*.json")):
+        try:
+            with open(path, "r") as f:
+                speakers.append(json.load(f))
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Failed to load {path}: {e}", file=sys.stderr)
+
+    return speakers
+
+
+def filter_speakers_by_tags(
+    speakers: List[Dict[str, Any]],
+    tags: Optional[List[str]] = None,
+    any_tag: bool = False,
+) -> List[Dict[str, Any]]:
+    """Filter speakers by tags (AND or OR logic)."""
+    if not tags:
+        return speakers
+
+    tag_set = set(tags)
+    result = []
+
+    for speaker in speakers:
+        speaker_tags = set(speaker.get("tags", []))
+        if any_tag:
+            # OR logic: at least one tag matches
+            if speaker_tags & tag_set:
+                result.append(speaker)
+        else:
+            # AND logic: all tags must match
+            if tag_set <= speaker_tags:
+                result.append(speaker)
+
+    return result
+
+
+# ----------------------------------------------------------------------
+# Output Formatting
+# ----------------------------------------------------------------------
+
+def format_table(speakers: List[Dict[str, Any]], context: str = "default") -> str:
+    """Format speakers as a table."""
+    if not speakers:
+        return "No speakers found."
+
+    # Calculate column widths
+    id_width = max(len(s["id"]) for s in speakers)
+    id_width = max(id_width, 2)
+
+    name_width = max(len(s["names"].get(context, s["names"]["default"])) for s in speakers)
+    name_width = max(name_width, 4)
+
+    lines = []
+    header = f"{'ID':<{id_width}}  {'Name':<{name_width}}  Tags"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for s in speakers:
+        name = s["names"].get(context, s["names"]["default"])
+        tags = ", ".join(s.get("tags", []))
+        lines.append(f"{s['id']:<{id_width}}  {name:<{name_width}}  {tags}")
+
+    return "\n".join(lines)
+
+
+def format_ids(speakers: List[Dict[str, Any]]) -> str:
+    """Format speakers as a list of IDs."""
+    return "\n".join(s["id"] for s in speakers)
+
+
+# ----------------------------------------------------------------------
+# CLI Commands
+# ----------------------------------------------------------------------
+
+def cmd_add(args) -> int:
+    """Add a new speaker."""
+    speaker_id = normalize_speaker_id(args.id)
+
+    if not validate_speaker_id(speaker_id):
+        print(f"Error: Invalid speaker ID '{speaker_id}'. Must be lowercase alphanumeric with hyphens/underscores.", file=sys.stderr)
+        return 1
+
+    if load_speaker(speaker_id):
+        print(f"Error: Speaker '{speaker_id}' already exists. Use 'update' to modify.", file=sys.stderr)
+        return 1
+
+    # Parse name contexts
+    name_contexts = {}
+    if args.name_context:
+        for nc in args.name_context:
+            if "=" not in nc:
+                print(f"Error: Invalid name-context format '{nc}'. Use 'context=name'.", file=sys.stderr)
+                return 1
+            ctx, name = nc.split("=", 1)
+            name_contexts[ctx] = name
+
+    # Parse metadata
+    metadata = {}
+    if args.metadata:
+        for m in args.metadata:
+            if "=" not in m:
+                print(f"Error: Invalid metadata format '{m}'. Use 'key=value'.", file=sys.stderr)
+                return 1
+            key, value = m.split("=", 1)
+            metadata[key] = value
+
+    profile = create_speaker_profile(
+        speaker_id=speaker_id,
+        name=args.name,
+        name_contexts=name_contexts,
+        nicknames=args.nickname,
+        description=args.description,
+        metadata=metadata,
+        tags=args.tag,
+    )
+
+    save_speaker(profile)
+    print(f"Added speaker: {speaker_id}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    """List speakers."""
+    speakers = list_all_speakers()
+
+    # Parse tags
+    tags = None
+    if args.tags:
+        tags = [t.strip() for t in args.tags.split(",")]
+    if args.any_tag:
+        any_tags = [t.strip() for t in args.any_tag.split(",")]
+        speakers = filter_speakers_by_tags(speakers, any_tags, any_tag=True)
+    if tags:
+        speakers = filter_speakers_by_tags(speakers, tags, any_tag=False)
+
+    context = args.context or "default"
+
+    if args.format == "json":
+        print(json.dumps(speakers, indent=2, ensure_ascii=False))
+    elif args.format == "ids":
+        print(format_ids(speakers))
+    else:  # table
+        print(format_table(speakers, context))
+
+    return 0
+
+
+def cmd_show(args) -> int:
+    """Show a speaker's profile."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    if args.format == "yaml":
+        try:
+            import yaml
+            print(yaml.dump(profile, default_flow_style=False, allow_unicode=True))
+        except ImportError:
+            print("Error: PyYAML not installed. Use --format json instead.", file=sys.stderr)
+            return 1
+    else:
+        print(json.dumps(profile, indent=2, ensure_ascii=False))
+
+    return 0
+
+
+def cmd_update(args) -> int:
+    """Update a speaker's profile."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    # Update name
+    if args.name:
+        profile["names"]["default"] = args.name
+
+    # Update name contexts
+    if args.name_context:
+        for nc in args.name_context:
+            if "=" not in nc:
+                print(f"Error: Invalid name-context format '{nc}'. Use 'context=name'.", file=sys.stderr)
+                return 1
+            ctx, name = nc.split("=", 1)
+            profile["names"][ctx] = name
+
+    # Update description
+    if args.description is not None:
+        profile["description"] = args.description
+
+    # Add nicknames
+    if args.nickname:
+        existing = set(profile.get("nicknames", []))
+        existing.update(args.nickname)
+        profile["nicknames"] = list(existing)
+
+    # Remove nicknames
+    if args.remove_nickname:
+        existing = set(profile.get("nicknames", []))
+        existing -= set(args.remove_nickname)
+        profile["nicknames"] = list(existing)
+
+    # Add tags
+    if args.tag:
+        existing = set(profile.get("tags", []))
+        existing.update(args.tag)
+        profile["tags"] = list(existing)
+
+    # Remove tags
+    if args.remove_tag:
+        existing = set(profile.get("tags", []))
+        existing -= set(args.remove_tag)
+        profile["tags"] = list(existing)
+
+    # Update metadata
+    if args.metadata:
+        for m in args.metadata:
+            if "=" not in m:
+                print(f"Error: Invalid metadata format '{m}'. Use 'key=value'.", file=sys.stderr)
+                return 1
+            key, value = m.split("=", 1)
+            profile["metadata"][key] = value
+
+    save_speaker(profile)
+    print(f"Updated speaker: {speaker_id}")
+    return 0
+
+
+def cmd_delete(args) -> int:
+    """Delete a speaker."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    if not args.force:
+        response = input(f"Delete speaker '{speaker_id}'? [y/N] ")
+        if response.lower() != "y":
+            print("Cancelled.")
+            return 0
+
+    # Delete speaker file
+    delete_speaker_file(speaker_id)
+
+    # Delete embeddings directory
+    emb_dir = get_embeddings_path() / speaker_id
+    if emb_dir.exists():
+        import shutil
+        shutil.rmtree(emb_dir)
+
+    print(f"Deleted speaker: {speaker_id}")
+    return 0
+
+
+def cmd_tag(args) -> int:
+    """Add or remove tags from a speaker."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    tags = set(profile.get("tags", []))
+
+    if args.add:
+        tags.add(args.add)
+        profile["tags"] = list(tags)
+        save_speaker(profile)
+        print(f"Added tag '{args.add}' to {speaker_id}")
+
+    if args.remove:
+        tags.discard(args.remove)
+        profile["tags"] = list(tags)
+        save_speaker(profile)
+        print(f"Removed tag '{args.remove}' from {speaker_id}")
+
+    return 0
+
+
+def cmd_export(args) -> int:
+    """Export speakers for STT integration."""
+    speakers = list_all_speakers()
+
+    # Filter by tags
+    if args.tags:
+        tags = [t.strip() for t in args.tags.split(",")]
+        speakers = filter_speakers_by_tags(speakers, tags, any_tag=False)
+
+    context = args.context or "default"
+
+    # Build export data
+    if args.format == "speechmatics":
+        export_data = {
+            "speakers": [
+                {
+                    "id": s["id"],
+                    "name": s["names"].get(context, s["names"]["default"]),
+                }
+                for s in speakers
+            ]
+        }
+    else:  # json
+        export_data = {
+            "speakers": [
+                {
+                    "id": s["id"],
+                    "name": s["names"].get(context, s["names"]["default"]),
+                    "nicknames": s.get("nicknames", []),
+                    "tags": s.get("tags", []),
+                    "embeddings": {
+                        backend: len(embs)
+                        for backend, embs in s.get("embeddings", {}).items()
+                    },
+                }
+                for s in speakers
+            ],
+            "context": context,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    output = json.dumps(export_data, indent=2, ensure_ascii=False)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(output)
+        print(f"Exported {len(speakers)} speakers to {args.output}", file=sys.stderr)
+    else:
+        print(output)
+
+    return 0
+
+
+def cmd_query(args) -> int:
+    """Query speakers using jq-style expressions."""
+    import subprocess
+
+    speakers = list_all_speakers()
+
+    # Use jq if available
+    try:
+        proc = subprocess.run(
+            ["jq", args.expression],
+            input=json.dumps(speakers),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            print(proc.stdout.rstrip())
+        else:
+            print(f"jq error: {proc.stderr}", file=sys.stderr)
+            return 1
+    except FileNotFoundError:
+        print("Error: 'jq' command not found. Install jq for query support.", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+def parse_segments(segments_str: str) -> List[tuple]:
+    """
+    Parse segments string into list of (start, end) tuples.
+
+    Format: "10.5:45.2,78:120" -> [(10.5, 45.2), (78.0, 120.0)]
+    """
+    segments = []
+    for part in segments_str.split(","):
+        part = part.strip()
+        if ":" not in part:
+            raise ValueError(f"Invalid segment format '{part}'. Use 'start:end'.")
+        start_str, end_str = part.split(":", 1)
+        try:
+            start = float(start_str)
+            end = float(end_str)
+        except ValueError:
+            raise ValueError(f"Invalid segment times '{part}'. Must be numeric.")
+        if start >= end:
+            raise ValueError(f"Invalid segment '{part}'. Start must be < end.")
+        segments.append((start, end))
+    return segments
+
+
+def cmd_enroll(args) -> int:
+    """Enroll speaker embeddings from audio."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found. Use 'add' first.", file=sys.stderr)
+        return 1
+
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    # Determine backend
+    backend_name = args.backend or os.environ.get("SPEAKER_DETECTION_BACKEND", "speechmatics")
+
+    # Parse segments
+    segments = None
+    if args.segments:
+        try:
+            segments = parse_segments(args.segments)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+    elif args.from_transcript:
+        # Extract segments from transcript
+        transcript_path = Path(args.from_transcript)
+        if not transcript_path.exists():
+            print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+            return 1
+
+        speaker_label = args.speaker_label
+        if not speaker_label:
+            print("Error: --speaker-label required with --from-transcript", file=sys.stderr)
+            return 1
+
+        try:
+            from speaker_detection_backends.base import EmbeddingBackend
+
+            # Use base class method to extract segments
+            class TempBackend(EmbeddingBackend):
+                @property
+                def name(self): return "temp"
+                @property
+                def requires_api_key(self): return False
+                def enroll_speaker(self, *a, **k): pass
+                def identify_speaker(self, *a, **k): pass
+
+            temp = TempBackend()
+            segments = temp.extract_segments_from_transcript(transcript_path, speaker_label)
+
+            if not segments:
+                print(f"Error: No segments found for speaker '{speaker_label}' in transcript.", file=sys.stderr)
+                return 1
+
+            # Calculate total duration
+            total_duration = sum(end - start for start, end in segments)
+            print(f"Found {len(segments)} segments for speaker '{speaker_label}' ({total_duration:.1f}s total)", file=sys.stderr)
+
+        except Exception as e:
+            print(f"Error extracting segments: {e}", file=sys.stderr)
+            return 1
+
+    # Load backend
+    try:
+        from speaker_detection_backends import get_backend
+        backend = get_backend(backend_name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except ImportError as e:
+        print(f"Error loading backend '{backend_name}': {e}", file=sys.stderr)
+        return 1
+
+    # Run enrollment
+    print(f"Enrolling speaker '{speaker_id}' using {backend_name}...", file=sys.stderr)
+    try:
+        result = backend.enroll_speaker(audio_path, segments)
+    except Exception as e:
+        print(f"Error during enrollment: {e}", file=sys.stderr)
+        return 1
+
+    # Generate embedding ID
+    emb_id = f"emb-{uuid.uuid4().hex[:8]}"
+
+    # Build embedding record
+    embedding_record = {
+        "id": emb_id,
+        "external_id": result.get("external_id"),
+        "source_audio": str(audio_path.resolve()),
+        "source_segments": [{"start": s, "end": e} for s, e in segments] if segments else None,
+        "model_version": result.get("model_version", "unknown"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Add any additional identifiers
+    if "all_identifiers" in result:
+        embedding_record["all_identifiers"] = result["all_identifiers"]
+
+    # Store embedding in profile
+    if backend_name not in profile["embeddings"]:
+        profile["embeddings"][backend_name] = []
+
+    profile["embeddings"][backend_name].append(embedding_record)
+    save_speaker(profile)
+
+    print(f"Enrolled embedding {emb_id} for speaker '{speaker_id}'")
+    return 0
+
+
+def cmd_embeddings(args) -> int:
+    """List embeddings for a speaker."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    embeddings = profile.get("embeddings", {})
+
+    # Filter by backend if specified
+    if args.backend:
+        if args.backend in embeddings:
+            embeddings = {args.backend: embeddings[args.backend]}
+        else:
+            embeddings = {}
+
+    if not embeddings:
+        print("No embeddings found.")
+        return 0
+
+    # Format output
+    for backend, embs in embeddings.items():
+        print(f"\n{backend}:")
+        for emb in embs:
+            created = emb.get("created_at", "unknown")[:19]
+            source = emb.get("source_audio", "unknown")
+            if len(source) > 50:
+                source = "..." + source[-47:]
+            print(f"  {emb['id']}  {created}  {source}")
+
+    return 0
+
+
+def cmd_remove_embedding(args) -> int:
+    """Remove an embedding from a speaker."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    emb_id = args.embedding_id
+    found = False
+
+    for backend, embs in profile.get("embeddings", {}).items():
+        for i, emb in enumerate(embs):
+            if emb["id"] == emb_id:
+                embs.pop(i)
+                found = True
+                break
+        if found:
+            break
+
+    if not found:
+        print(f"Error: Embedding '{emb_id}' not found for speaker '{speaker_id}'.", file=sys.stderr)
+        return 1
+
+    save_speaker(profile)
+    print(f"Removed embedding {emb_id} from speaker '{speaker_id}'")
+    return 0
+
+
+def cmd_identify(args) -> int:
+    """Identify speaker in audio."""
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    # Determine backend
+    backend_name = args.backend or os.environ.get("SPEAKER_DETECTION_BACKEND", "speechmatics")
+
+    # Load speakers
+    speakers = list_all_speakers()
+
+    # Filter by tags if specified
+    if args.tags:
+        tags = [t.strip() for t in args.tags.split(",")]
+        speakers = filter_speakers_by_tags(speakers, tags, any_tag=False)
+
+    if not speakers:
+        print("No speakers to match against.", file=sys.stderr)
+        return 1
+
+    # Filter to speakers with embeddings for this backend
+    candidates = [s for s in speakers if s.get("embeddings", {}).get(backend_name)]
+
+    if not candidates:
+        print(f"No speakers with {backend_name} embeddings.", file=sys.stderr)
+        return 1
+
+    # Load backend
+    try:
+        from speaker_detection_backends import get_backend
+        backend = get_backend(backend_name)
+    except (ValueError, ImportError) as e:
+        print(f"Error loading backend: {e}", file=sys.stderr)
+        return 1
+
+    # Run identification
+    print(f"Identifying speaker in {audio_path.name} against {len(candidates)} candidates...", file=sys.stderr)
+    try:
+        results = backend.identify_speaker(audio_path, candidates, args.threshold)
+    except Exception as e:
+        print(f"Error during identification: {e}", file=sys.stderr)
+        return 1
+
+    if not results:
+        print("No matching speakers found.")
+        return 0
+
+    # Display results
+    print("\nMatches:")
+    for r in results:
+        speaker_id = r["speaker_id"]
+        profile = load_speaker(speaker_id)
+        name = profile["names"]["default"] if profile else speaker_id
+        confidence = r.get("confidence", r.get("similarity", 0))
+        print(f"  {speaker_id}: {name} (confidence: {confidence:.2f})")
+
+    return 0
+
+
+def cmd_verify(args) -> int:
+    """Verify if audio matches a specific speaker."""
+    speaker_id = normalize_speaker_id(args.id)
+    profile = load_speaker(speaker_id)
+
+    if not profile:
+        print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+        return 1
+
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    # Determine backend
+    backend_name = args.backend or os.environ.get("SPEAKER_DETECTION_BACKEND", "speechmatics")
+
+    if not profile.get("embeddings", {}).get(backend_name):
+        print(f"Error: Speaker '{speaker_id}' has no {backend_name} embeddings.", file=sys.stderr)
+        return 1
+
+    # Load backend
+    try:
+        from speaker_detection_backends import get_backend
+        backend = get_backend(backend_name)
+    except (ValueError, ImportError) as e:
+        print(f"Error loading backend: {e}", file=sys.stderr)
+        return 1
+
+    # Run verification
+    print(f"Verifying audio against speaker '{speaker_id}'...", file=sys.stderr)
+    try:
+        result = backend.verify_speaker(audio_path, profile, args.threshold)
+    except Exception as e:
+        print(f"Error during verification: {e}", file=sys.stderr)
+        return 1
+
+    if result["match"]:
+        print(f"MATCH: Speaker '{speaker_id}' verified (confidence: {result['confidence']:.2f})")
+        return 0
+    else:
+        print(f"NO MATCH: Audio does not match speaker '{speaker_id}'")
+        return 1
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Speaker detection and embedding management CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # add command
+    add_parser = subparsers.add_parser("add", help="Add a new speaker")
+    add_parser.add_argument("id", help="Speaker ID (lowercase alphanumeric with hyphens)")
+    add_parser.add_argument("--name", required=True, help="Default display name")
+    add_parser.add_argument("--name-context", action="append", metavar="CTX=NAME",
+                           help="Context-specific name (repeatable)")
+    add_parser.add_argument("--nickname", action="append", help="Nickname (repeatable)")
+    add_parser.add_argument("--description", help="Speaker description")
+    add_parser.add_argument("--tag", action="append", help="Tag (repeatable)")
+    add_parser.add_argument("--metadata", action="append", metavar="KEY=VALUE",
+                           help="Metadata key=value (repeatable)")
+    add_parser.set_defaults(func=cmd_add)
+
+    # list command
+    list_parser = subparsers.add_parser("list", help="List speakers")
+    list_parser.add_argument("--tags", help="Filter by tags (comma-separated, AND logic)")
+    list_parser.add_argument("--any-tag", help="Filter by tags (comma-separated, OR logic)")
+    list_parser.add_argument("--format", choices=["table", "json", "ids"], default="table",
+                            help="Output format (default: table)")
+    list_parser.add_argument("--context", help="Name context for display")
+    list_parser.set_defaults(func=cmd_list)
+
+    # show command
+    show_parser = subparsers.add_parser("show", help="Show speaker details")
+    show_parser.add_argument("id", help="Speaker ID")
+    show_parser.add_argument("--format", choices=["json", "yaml"], default="json",
+                            help="Output format (default: json)")
+    show_parser.set_defaults(func=cmd_show)
+
+    # update command
+    update_parser = subparsers.add_parser("update", help="Update speaker")
+    update_parser.add_argument("id", help="Speaker ID")
+    update_parser.add_argument("--name", help="Update default name")
+    update_parser.add_argument("--name-context", action="append", metavar="CTX=NAME",
+                              help="Add/update context-specific name")
+    update_parser.add_argument("--description", help="Update description")
+    update_parser.add_argument("--nickname", action="append", help="Add nickname")
+    update_parser.add_argument("--remove-nickname", action="append", help="Remove nickname")
+    update_parser.add_argument("--tag", action="append", help="Add tag")
+    update_parser.add_argument("--remove-tag", action="append", help="Remove tag")
+    update_parser.add_argument("--metadata", action="append", metavar="KEY=VALUE",
+                              help="Add/update metadata")
+    update_parser.set_defaults(func=cmd_update)
+
+    # delete command
+    delete_parser = subparsers.add_parser("delete", help="Delete speaker")
+    delete_parser.add_argument("id", help="Speaker ID")
+    delete_parser.add_argument("--force", "-f", action="store_true",
+                              help="Skip confirmation prompt")
+    delete_parser.set_defaults(func=cmd_delete)
+
+    # tag command
+    tag_parser = subparsers.add_parser("tag", help="Manage speaker tags")
+    tag_parser.add_argument("id", help="Speaker ID")
+    tag_parser.add_argument("--add", help="Tag to add")
+    tag_parser.add_argument("--remove", help="Tag to remove")
+    tag_parser.set_defaults(func=cmd_tag)
+
+    # export command
+    export_parser = subparsers.add_parser("export", help="Export speakers for STT")
+    export_parser.add_argument("--tags", help="Filter by tags (comma-separated)")
+    export_parser.add_argument("--context", help="Name context for export")
+    export_parser.add_argument("--format", choices=["json", "speechmatics"], default="json",
+                              help="Export format (default: json)")
+    export_parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    export_parser.set_defaults(func=cmd_export)
+
+    # query command
+    query_parser = subparsers.add_parser("query", help="Query with jq expression")
+    query_parser.add_argument("expression", help="jq filter expression")
+    query_parser.set_defaults(func=cmd_query)
+
+    # enroll command
+    enroll_parser = subparsers.add_parser("enroll", help="Enroll speaker from audio")
+    enroll_parser.add_argument("id", help="Speaker ID")
+    enroll_parser.add_argument("audio", help="Audio file path")
+    enroll_parser.add_argument("--backend", "-b", help="Embedding backend (default: speechmatics)")
+    enroll_parser.add_argument("--segments", "-s",
+                               help="Time segments to extract: start:end,start:end (e.g., 10.5:45.2,78:120)")
+    enroll_parser.add_argument("--from-transcript", "-t", metavar="JSON",
+                               help="Extract segments from transcript JSON")
+    enroll_parser.add_argument("--speaker-label", "-l",
+                               help="Speaker label in transcript (e.g., 'A', 'S1')")
+    enroll_parser.set_defaults(func=cmd_enroll)
+
+    # embeddings command
+    emb_parser = subparsers.add_parser("embeddings", help="List speaker embeddings")
+    emb_parser.add_argument("id", help="Speaker ID")
+    emb_parser.add_argument("--backend", "-b", help="Filter by backend")
+    emb_parser.set_defaults(func=cmd_embeddings)
+
+    # remove-embedding command
+    rem_emb_parser = subparsers.add_parser("remove-embedding", help="Remove an embedding")
+    rem_emb_parser.add_argument("id", help="Speaker ID")
+    rem_emb_parser.add_argument("embedding_id", help="Embedding ID to remove")
+    rem_emb_parser.set_defaults(func=cmd_remove_embedding)
+
+    # identify command
+    identify_parser = subparsers.add_parser("identify", help="Identify speaker in audio")
+    identify_parser.add_argument("audio", help="Audio file to identify")
+    identify_parser.add_argument("--backend", "-b", help="Embedding backend")
+    identify_parser.add_argument("--tags", help="Filter candidates by tags (comma-separated)")
+    identify_parser.add_argument("--threshold", type=float, default=0.354,
+                                 help="Similarity threshold (default: 0.354)")
+    identify_parser.set_defaults(func=cmd_identify)
+
+    # verify command
+    verify_parser = subparsers.add_parser("verify", help="Verify speaker in audio")
+    verify_parser.add_argument("id", help="Speaker ID to verify against")
+    verify_parser.add_argument("audio", help="Audio file to verify")
+    verify_parser.add_argument("--backend", "-b", help="Embedding backend")
+    verify_parser.add_argument("--threshold", type=float, default=0.354,
+                               help="Similarity threshold (default: 0.354)")
+    verify_parser.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
