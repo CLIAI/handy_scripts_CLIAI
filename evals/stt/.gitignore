@@ -1,0 +1,9 @@
+# Intermediate audio
+/audio/*.wav
+
+# Per-run transcripts and reports
+/results/
+
+# STT JSON responses written next to audio files
+/audio/*.assemblyai.json
+/audio/*.speechmatics.json

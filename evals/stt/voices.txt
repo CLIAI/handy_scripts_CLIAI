@@ -1,0 +1,4 @@
+# One voice per line. Use `espeak-ng --voices` to list.
+en
+en-us
+en-uk

@@ -1,0 +1,1 @@
+This is a longer paragraph for testing speech recognition. It contains two short sentences with common words and clear pronunciation. The goal is to verify that longer inputs are handled correctly.
