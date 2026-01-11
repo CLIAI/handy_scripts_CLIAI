@@ -379,13 +379,34 @@ class SpeechmaticsBackend(EmbeddingBackend):
         # Extract identified speakers from results
         results = transcript.get("results", [])
         identified = set()
+        all_speakers_found = set()  # For debugging
 
         for item in results:
             if item.get("type") != "word":
                 continue
+            # Speaker label can be at top level or inside alternatives
             speaker = item.get("speaker")
-            if speaker and speaker in id_to_speaker:
-                identified.add(speaker)
+            if not speaker:
+                # Check inside alternatives array (Speechmatics format)
+                alternatives = item.get("alternatives", [])
+                if alternatives:
+                    speaker = alternatives[0].get("speaker")
+            if speaker:
+                all_speakers_found.add(speaker)
+                if speaker in id_to_speaker:
+                    identified.add(speaker)
+
+        # Debug: log what speakers were found vs expected
+        import os
+        if os.environ.get("SPEAKER_DETECTION_DEBUG"):
+            import sys
+            print(f"DEBUG: speakers_config labels: {[s['label'] for s in speakers_config]}", file=sys.stderr)
+            print(f"DEBUG: all speakers found in transcript: {all_speakers_found}", file=sys.stderr)
+            print(f"DEBUG: matched to candidates: {identified}", file=sys.stderr)
+            print(f"DEBUG: transcript keys: {transcript.keys()}", file=sys.stderr)
+            print(f"DEBUG: results count: {len(results)}", file=sys.stderr)
+            if results:
+                print(f"DEBUG: first result: {results[0]}", file=sys.stderr)
 
         # Return matches
         matches = []

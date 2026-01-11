@@ -473,11 +473,17 @@ def format_transcript_txt(transcript_json, args):
         item_type = item.get('type')
 
         if item_type == 'word':
-            speaker = item.get('speaker', 'UU')
+            # Speaker can be at top level or inside alternatives
+            speaker = item.get('speaker')
             # Get content from alternatives
             content = ''
-            if item.get('alternatives'):
-                content = item['alternatives'][0].get('content', '')
+            alternatives = item.get('alternatives', [])
+            if alternatives:
+                content = alternatives[0].get('content', '')
+                # Also check for speaker in alternatives (used with speaker identification)
+                if not speaker:
+                    speaker = alternatives[0].get('speaker')
+            speaker = speaker or 'UU'
 
             if args.diarisation:
                 if speaker != current_speaker:
