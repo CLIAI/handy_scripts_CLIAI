@@ -1,0 +1,7 @@
+# Generated audio files (use `make` to regenerate)
+*.wav
+*.ogg
+*.mp3
+
+# Keep transcript files for reference
+!*.json

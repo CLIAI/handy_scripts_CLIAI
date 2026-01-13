@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+speaker_samples - Voice sample extraction and management tool
+
+Extract voice samples from audio files using transcript timing information.
+Store samples with full provenance metadata for speaker enrollment.
+
+Usage:
+    # Extract samples from transcript
+    speaker_samples extract --transcript file.json --speaker-label S1 --speaker-id alice audio.mp3
+
+    # Output segment times as JSONL (for piping)
+    speaker_samples segments --transcript file.json --speaker-label S1 audio.mp3
+
+    # List stored samples
+    speaker_samples list [person_id]
+
+    # Show sample metadata
+    speaker_samples info <person_id> <sample_id>
+
+    # Remove samples
+    speaker_samples remove <person_id> [--all] [--source pattern]
+
+Environment:
+    SPEAKERS_EMBEDDINGS_DIR - Storage location (default: ~/.config/speakers_embeddings)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+
+DEFAULT_DB_DIR = os.path.expanduser("~/.config/speakers_embeddings")
+METADATA_VERSION = 1
+
+
+def get_db_dir() -> Path:
+    """Get the speakers embeddings directory."""
+    return Path(os.environ.get("SPEAKERS_EMBEDDINGS_DIR", DEFAULT_DB_DIR))
+
+
+def get_samples_dir() -> Path:
+    """Get the samples storage directory."""
+    return get_db_dir() / "samples"
+
+
+def get_speaker_samples_dir(speaker_id: str) -> Path:
+    """Get samples directory for a specific speaker."""
+    return get_samples_dir() / speaker_id
+
+
+def ensure_speaker_samples_dir(speaker_id: str) -> Path:
+    """Ensure speaker samples directory exists."""
+    path = get_speaker_samples_dir(speaker_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# ----------------------------------------------------------------------
+# Transcript Parsing
+# ----------------------------------------------------------------------
+
+def detect_transcript_format(data: Dict[str, Any]) -> str:
+    """
+    Detect transcript format from JSON structure.
+
+    Returns:
+        'assemblyai', 'speechmatics', or 'unknown'
+    """
+    if "utterances" in data:
+        return "assemblyai"
+    if "results" in data and isinstance(data.get("results"), list):
+        # Check for Speechmatics-style structure
+        if data["results"] and "alternatives" in data["results"][0]:
+            return "speechmatics"
+        if data["results"] and "start_time" in data["results"][0]:
+            return "speechmatics"
+    return "unknown"
+
+
+def get_available_speakers(data: Dict[str, Any]) -> List[str]:
+    """Get list of speaker labels in transcript."""
+    fmt = detect_transcript_format(data)
+    speakers = set()
+
+    if fmt == "assemblyai":
+        for utt in data.get("utterances", []):
+            if "speaker" in utt:
+                speakers.add(utt["speaker"])
+    elif fmt == "speechmatics":
+        for item in data.get("results", []):
+            if item.get("type") != "word":
+                continue
+            # Check top level
+            if "speaker" in item:
+                speakers.add(item["speaker"])
+            # Check alternatives (Speechmatics with speaker ID)
+            for alt in item.get("alternatives", []):
+                if "speaker" in alt:
+                    speakers.add(alt["speaker"])
+
+    return sorted(speakers)
+
+
+def extract_segments_from_transcript(
+    data: Dict[str, Any],
+    speaker_label: str,
+    min_duration: float = 0.5,
+    max_gap: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """
+    Extract time segments for a speaker from transcript.
+
+    Args:
+        data: Transcript JSON data
+        speaker_label: Speaker label to extract
+        min_duration: Minimum segment duration in seconds
+        max_gap: Maximum gap to merge adjacent segments
+
+    Returns:
+        List of segment dicts with start, end, text
+    """
+    fmt = detect_transcript_format(data)
+    raw_segments = []
+
+    if fmt == "assemblyai":
+        for utt in data.get("utterances", []):
+            if utt.get("speaker") == speaker_label:
+                start = utt.get("start", 0) / 1000.0  # ms to sec
+                end = utt.get("end", 0) / 1000.0
+                text = utt.get("text", "")
+                raw_segments.append({"start": start, "end": end, "text": text})
+
+    elif fmt == "speechmatics":
+        current_start = None
+        current_end = None
+        current_text = []
+        current_speaker = None
+
+        for item in data.get("results", []):
+            if item.get("type") != "word":
+                continue
+
+            # Get speaker - check alternatives first (speaker identification mode)
+            speaker = item.get("speaker")
+            content = ""
+            alternatives = item.get("alternatives", [])
+            if alternatives:
+                if not speaker:
+                    speaker = alternatives[0].get("speaker")
+                content = alternatives[0].get("content", "")
+
+            speaker = speaker or "UU"
+            start = item.get("start_time", 0)
+            end = item.get("end_time", 0)
+
+            if speaker == speaker_label:
+                if current_speaker != speaker_label:
+                    # New segment starts
+                    if current_start is not None:
+                        raw_segments.append({
+                            "start": current_start,
+                            "end": current_end,
+                            "text": " ".join(current_text),
+                        })
+                    current_start = start
+                    current_text = []
+                current_end = end
+                current_speaker = speaker_label
+                if content:
+                    current_text.append(content)
+            else:
+                # Speaker changed
+                if current_speaker == speaker_label and current_start is not None:
+                    raw_segments.append({
+                        "start": current_start,
+                        "end": current_end,
+                        "text": " ".join(current_text),
+                    })
+                    current_start = None
+                    current_text = []
+                current_speaker = speaker
+
+        # Don't forget last segment
+        if current_speaker == speaker_label and current_start is not None:
+            raw_segments.append({
+                "start": current_start,
+                "end": current_end,
+                "text": " ".join(current_text),
+            })
+
+    # Merge close segments and filter by duration
+    merged = []
+    for seg in raw_segments:
+        duration = seg["end"] - seg["start"]
+        if duration < min_duration:
+            continue
+
+        if merged and (seg["start"] - merged[-1]["end"]) <= max_gap:
+            # Merge with previous
+            merged[-1]["end"] = seg["end"]
+            if seg["text"]:
+                merged[-1]["text"] = (merged[-1]["text"] + " " + seg["text"]).strip()
+        else:
+            merged.append(seg)
+
+    return merged
+
+
+# ----------------------------------------------------------------------
+# Audio Extraction
+# ----------------------------------------------------------------------
+
+def compute_file_hash(file_path: Path, algorithm: str = "sha256") -> str:
+    """Compute hash of file contents."""
+    h = hashlib.new(algorithm)
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return f"{algorithm}:{h.hexdigest()}"
+
+
+def extract_audio_segment(
+    audio_path: Path,
+    output_path: Path,
+    start: float,
+    end: float,
+    format: str = "mp3",
+) -> bool:
+    """
+    Extract audio segment using ffmpeg.
+
+    Args:
+        audio_path: Source audio file
+        output_path: Output file path
+        start: Start time in seconds
+        end: End time in seconds
+        format: Output format (mp3, wav)
+
+    Returns:
+        True if successful
+    """
+    duration = end - start
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
+        "-ss", str(start),
+        "-t", str(duration),
+        "-ac", "1",  # mono
+        "-ar", "16000",  # 16kHz
+    ]
+
+    if format == "mp3":
+        cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+    elif format == "wav":
+        cmd.extend(["-c:a", "pcm_s16le"])
+
+    cmd.append(str(output_path))
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"ffmpeg error: {e.stderr.decode()}", file=sys.stderr)
+        return False
+    except FileNotFoundError:
+        print("Error: ffmpeg not found. Please install ffmpeg.", file=sys.stderr)
+        return False
+
+
+def get_next_sample_id(speaker_dir: Path) -> str:
+    """Get next available sample ID for a speaker."""
+    existing = []
+    for f in speaker_dir.glob("sample-*.mp3"):
+        try:
+            num = int(f.stem.split("-")[1])
+            existing.append(num)
+        except (ValueError, IndexError):
+            pass
+    for f in speaker_dir.glob("sample-*.wav"):
+        try:
+            num = int(f.stem.split("-")[1])
+            existing.append(num)
+        except (ValueError, IndexError):
+            pass
+
+    next_num = max(existing, default=0) + 1
+    return f"sample-{next_num:03d}"
+
+
+def write_metadata(
+    meta_path: Path,
+    sample_id: str,
+    audio_path: Path,
+    audio_hash: str,
+    transcript_path: Optional[Path],
+    segment: Dict[str, Any],
+    speaker_label: str,
+) -> None:
+    """Write sample metadata YAML file."""
+    meta = {
+        "version": METADATA_VERSION,
+        "sample_id": sample_id,
+        "source": {
+            "audio_file": str(audio_path.resolve()),
+            "audio_hash": audio_hash,
+        },
+        "segment": {
+            "speaker_label": speaker_label,
+            "start_sec": segment["start"],
+            "end_sec": segment["end"],
+            "duration_sec": round(segment["end"] - segment["start"], 3),
+            "text": segment.get("text", ""),
+        },
+        "extraction": {
+            "tool": "speaker_samples",
+            "tool_version": "1.0.0",
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+
+    if transcript_path:
+        meta["source"]["transcript_file"] = str(transcript_path.resolve())
+
+    if YAML_AVAILABLE:
+        with open(meta_path, "w") as f:
+            yaml.dump(meta, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    else:
+        # Fallback to JSON if YAML not available
+        with open(meta_path.with_suffix(".meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+# ----------------------------------------------------------------------
+# CLI Commands
+# ----------------------------------------------------------------------
+
+def cmd_extract(args) -> int:
+    """Extract voice samples from audio using transcript."""
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    # Load transcript
+    transcript_path = Path(args.transcript)
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    with open(transcript_path) as f:
+        transcript_data = json.load(f)
+
+    # Detect format
+    fmt = detect_transcript_format(transcript_data)
+    if fmt == "unknown":
+        print("Error: Unknown transcript format. Supports AssemblyAI and Speechmatics.", file=sys.stderr)
+        return 1
+
+    # Check speaker label
+    speaker_label = args.speaker_label
+    available = get_available_speakers(transcript_data)
+
+    if not speaker_label:
+        print(f"Error: --speaker-label required. Available speakers: {', '.join(available)}", file=sys.stderr)
+        return 1
+
+    if speaker_label not in available:
+        print(f"Warning: Speaker '{speaker_label}' not found. Available: {', '.join(available)}", file=sys.stderr)
+
+    # Extract segments
+    segments = extract_segments_from_transcript(
+        transcript_data,
+        speaker_label,
+        min_duration=args.min_duration,
+        max_gap=args.max_gap,
+    )
+
+    if not segments:
+        print(f"No segments found for speaker '{speaker_label}'", file=sys.stderr)
+        return 1
+
+    total_duration = sum(s["end"] - s["start"] for s in segments)
+    print(f"Found {len(segments)} segments for '{speaker_label}' ({total_duration:.1f}s total)", file=sys.stderr)
+
+    # Apply limits
+    if args.max_segments:
+        segments = segments[:args.max_segments]
+    if args.max_duration:
+        filtered = []
+        running = 0
+        for seg in segments:
+            dur = seg["end"] - seg["start"]
+            if running + dur > args.max_duration:
+                break
+            filtered.append(seg)
+            running += dur
+        segments = filtered
+
+    if not segments:
+        print("No segments after filtering", file=sys.stderr)
+        return 1
+
+    # Setup output
+    speaker_id = args.speaker_id
+    speaker_dir = ensure_speaker_samples_dir(speaker_id)
+
+    # Compute audio hash once
+    audio_hash = compute_file_hash(audio_path)
+
+    # Extract each segment
+    extracted = 0
+    for seg in segments:
+        sample_id = get_next_sample_id(speaker_dir)
+        output_format = args.format or "mp3"
+        output_path = speaker_dir / f"{sample_id}.{output_format}"
+        meta_path = speaker_dir / f"{sample_id}.meta.yaml"
+
+        if args.dry_run:
+            print(f"Would extract: {sample_id} ({seg['start']:.2f}-{seg['end']:.2f}s)")
+            continue
+
+        if extract_audio_segment(audio_path, output_path, seg["start"], seg["end"], output_format):
+            write_metadata(meta_path, sample_id, audio_path, audio_hash, transcript_path, seg, speaker_label)
+            extracted += 1
+            if args.verbose:
+                print(f"Extracted: {sample_id} ({seg['start']:.2f}-{seg['end']:.2f}s)")
+        else:
+            print(f"Failed to extract segment {seg['start']:.2f}-{seg['end']:.2f}s", file=sys.stderr)
+
+    if not args.dry_run:
+        print(f"Extracted {extracted} samples to {speaker_dir}")
+
+    return 0
+
+
+def cmd_segments(args) -> int:
+    """Output segment times as JSONL for piping."""
+    # Load transcript
+    transcript_path = Path(args.transcript)
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    with open(transcript_path) as f:
+        transcript_data = json.load(f)
+
+    speaker_label = args.speaker_label
+    available = get_available_speakers(transcript_data)
+
+    if not speaker_label:
+        print(f"Error: --speaker-label required. Available speakers: {', '.join(available)}", file=sys.stderr)
+        return 1
+
+    # Extract segments
+    segments = extract_segments_from_transcript(
+        transcript_data,
+        speaker_label,
+        min_duration=args.min_duration,
+        max_gap=args.max_gap,
+    )
+
+    audio_path = args.audio
+    speaker_id = args.speaker_id or "unknown"
+
+    # Output as JSONL
+    for seg in segments:
+        record = {
+            "speaker_id": speaker_id,
+            "audio": str(audio_path) if audio_path else None,
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg.get("text", ""),
+        }
+        print(json.dumps(record))
+
+    return 0
+
+
+def cmd_list(args) -> int:
+    """List stored samples."""
+    samples_dir = get_samples_dir()
+
+    if not samples_dir.exists():
+        print("No samples found.")
+        return 0
+
+    if args.speaker_id:
+        # List samples for specific speaker
+        speaker_dir = samples_dir / args.speaker_id
+        if not speaker_dir.exists():
+            print(f"No samples found for speaker '{args.speaker_id}'")
+            return 0
+
+        samples = sorted(speaker_dir.glob("sample-*.mp3")) + sorted(speaker_dir.glob("sample-*.wav"))
+
+        if args.format == "json":
+            output = []
+            for sample in samples:
+                meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+                meta = {}
+                if meta_path.exists() and YAML_AVAILABLE:
+                    with open(meta_path) as f:
+                        meta = yaml.safe_load(f)
+                output.append({
+                    "sample_id": sample.stem,
+                    "file": str(sample),
+                    "duration": meta.get("segment", {}).get("duration_sec"),
+                    "text": meta.get("segment", {}).get("text", "")[:50],
+                })
+            print(json.dumps(output, indent=2))
+        else:
+            print(f"Samples for {args.speaker_id}:")
+            for sample in samples:
+                meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+                duration = "?"
+                if meta_path.exists() and YAML_AVAILABLE:
+                    with open(meta_path) as f:
+                        meta = yaml.safe_load(f)
+                        duration = f"{meta.get('segment', {}).get('duration_sec', '?'):.1f}s"
+                print(f"  {sample.stem}  {duration}  {sample.suffix}")
+    else:
+        # List all speakers with sample counts
+        speakers = []
+        for speaker_path in sorted(samples_dir.iterdir()):
+            if speaker_path.is_dir():
+                samples = list(speaker_path.glob("sample-*.mp3")) + list(speaker_path.glob("sample-*.wav"))
+                if samples:
+                    total_dur = 0
+                    for sample in samples:
+                        meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+                        if meta_path.exists() and YAML_AVAILABLE:
+                            with open(meta_path) as f:
+                                meta = yaml.safe_load(f)
+                                total_dur += meta.get("segment", {}).get("duration_sec", 0)
+                    speakers.append({
+                        "id": speaker_path.name,
+                        "count": len(samples),
+                        "duration": total_dur,
+                    })
+
+        if args.format == "json":
+            print(json.dumps(speakers, indent=2))
+        else:
+            if not speakers:
+                print("No samples found.")
+            else:
+                print(f"{'Speaker':<20} {'Samples':>8} {'Duration':>10}")
+                print("-" * 40)
+                for s in speakers:
+                    print(f"{s['id']:<20} {s['count']:>8} {s['duration']:>9.1f}s")
+
+    return 0
+
+
+def cmd_info(args) -> int:
+    """Show sample metadata."""
+    speaker_dir = get_speaker_samples_dir(args.speaker_id)
+
+    # Find sample
+    sample_path = None
+    for ext in [".mp3", ".wav"]:
+        candidate = speaker_dir / f"{args.sample_id}{ext}"
+        if candidate.exists():
+            sample_path = candidate
+            break
+
+    if not sample_path:
+        print(f"Error: Sample '{args.sample_id}' not found for speaker '{args.speaker_id}'", file=sys.stderr)
+        return 1
+
+    # Load metadata
+    meta_path = sample_path.with_suffix("").with_suffix(".meta.yaml")
+    if meta_path.exists() and YAML_AVAILABLE:
+        with open(meta_path) as f:
+            meta = yaml.safe_load(f)
+        if args.format == "json":
+            print(json.dumps(meta, indent=2, default=str))
+        else:
+            print(yaml.dump(meta, default_flow_style=False, allow_unicode=True))
+    else:
+        # Try JSON fallback
+        meta_json = sample_path.with_suffix("").with_suffix(".meta.json")
+        if meta_json.exists():
+            with open(meta_json) as f:
+                meta = json.load(f)
+            print(json.dumps(meta, indent=2, default=str))
+        else:
+            print(f"No metadata found for sample '{args.sample_id}'")
+            return 1
+
+    return 0
+
+
+def cmd_remove(args) -> int:
+    """Remove samples."""
+    speaker_dir = get_speaker_samples_dir(args.speaker_id)
+
+    if not speaker_dir.exists():
+        print(f"No samples found for speaker '{args.speaker_id}'")
+        return 0
+
+    samples = sorted(speaker_dir.glob("sample-*.mp3")) + sorted(speaker_dir.glob("sample-*.wav"))
+
+    if not samples:
+        print(f"No samples found for speaker '{args.speaker_id}'")
+        return 0
+
+    to_remove = []
+
+    if args.all:
+        to_remove = samples
+    elif args.source:
+        # Filter by source pattern
+        for sample in samples:
+            meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+            if meta_path.exists() and YAML_AVAILABLE:
+                with open(meta_path) as f:
+                    meta = yaml.safe_load(f)
+                source = meta.get("source", {}).get("audio_file", "")
+                if args.source in source:
+                    to_remove.append(sample)
+    elif args.sample_id:
+        for sample in samples:
+            if sample.stem == args.sample_id:
+                to_remove.append(sample)
+                break
+    else:
+        print("Error: Specify --all, --source, or sample_id", file=sys.stderr)
+        return 1
+
+    if not to_remove:
+        print("No matching samples found.")
+        return 0
+
+    if not args.force:
+        print(f"Will remove {len(to_remove)} samples:")
+        for s in to_remove[:5]:
+            print(f"  {s.stem}")
+        if len(to_remove) > 5:
+            print(f"  ... and {len(to_remove) - 5} more")
+        response = input("Continue? [y/N] ")
+        if response.lower() != "y":
+            print("Cancelled.")
+            return 0
+
+    removed = 0
+    for sample in to_remove:
+        sample.unlink()
+        # Remove metadata
+        for meta_ext in [".meta.yaml", ".meta.json"]:
+            meta_path = sample.with_suffix("").with_suffix(meta_ext)
+            if meta_path.exists():
+                meta_path.unlink()
+        removed += 1
+
+    print(f"Removed {removed} samples")
+
+    # Remove empty directory
+    if not any(speaker_dir.iterdir()):
+        speaker_dir.rmdir()
+
+    return 0
+
+
+def cmd_speakers(args) -> int:
+    """List available speakers in transcript."""
+    transcript_path = Path(args.transcript)
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    with open(transcript_path) as f:
+        transcript_data = json.load(f)
+
+    fmt = detect_transcript_format(transcript_data)
+    speakers = get_available_speakers(transcript_data)
+
+    print(f"Format: {fmt}")
+    print(f"Speakers: {', '.join(speakers) if speakers else 'none'}")
+
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Voice sample extraction and management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # extract command
+    extract_parser = subparsers.add_parser("extract", help="Extract samples from audio")
+    extract_parser.add_argument("audio", help="Audio file path")
+    extract_parser.add_argument("-t", "--transcript", required=True, help="Transcript JSON file")
+    extract_parser.add_argument("-l", "--speaker-label", required=True, help="Speaker label in transcript")
+    extract_parser.add_argument("-s", "--speaker-id", required=True, help="Target speaker ID for storage")
+    extract_parser.add_argument("--format", choices=["mp3", "wav"], default="mp3", help="Output format")
+    extract_parser.add_argument("--min-duration", type=float, default=0.5, help="Minimum segment duration (sec)")
+    extract_parser.add_argument("--max-gap", type=float, default=1.0, help="Max gap to merge segments (sec)")
+    extract_parser.add_argument("--max-segments", type=int, help="Maximum segments to extract")
+    extract_parser.add_argument("--max-duration", type=float, help="Maximum total duration (sec)")
+    extract_parser.add_argument("-n", "--dry-run", action="store_true", help="Show what would be extracted")
+    extract_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    extract_parser.set_defaults(func=cmd_extract)
+
+    # segments command
+    seg_parser = subparsers.add_parser("segments", help="Output segment times as JSONL")
+    seg_parser.add_argument("--transcript", "-t", required=True, help="Transcript JSON file")
+    seg_parser.add_argument("--speaker-label", "-l", required=True, help="Speaker label")
+    seg_parser.add_argument("--speaker-id", "-s", help="Speaker ID for output")
+    seg_parser.add_argument("--audio", "-a", help="Audio file path (for output)")
+    seg_parser.add_argument("--min-duration", type=float, default=0.5, help="Minimum segment duration")
+    seg_parser.add_argument("--max-gap", type=float, default=1.0, help="Max gap to merge")
+    seg_parser.set_defaults(func=cmd_segments)
+
+    # list command
+    list_parser = subparsers.add_parser("list", help="List stored samples")
+    list_parser.add_argument("speaker_id", nargs="?", help="Speaker ID (optional)")
+    list_parser.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+    list_parser.set_defaults(func=cmd_list)
+
+    # info command
+    info_parser = subparsers.add_parser("info", help="Show sample metadata")
+    info_parser.add_argument("speaker_id", help="Speaker ID")
+    info_parser.add_argument("sample_id", help="Sample ID")
+    info_parser.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output format")
+    info_parser.set_defaults(func=cmd_info)
+
+    # remove command
+    remove_parser = subparsers.add_parser("remove", help="Remove samples")
+    remove_parser.add_argument("speaker_id", help="Speaker ID")
+    remove_parser.add_argument("sample_id", nargs="?", help="Sample ID to remove")
+    remove_parser.add_argument("--all", action="store_true", help="Remove all samples")
+    remove_parser.add_argument("--source", help="Remove samples from matching source path")
+    remove_parser.add_argument("-f", "--force", action="store_true", help="Skip confirmation")
+    remove_parser.set_defaults(func=cmd_remove)
+
+    # speakers command (utility to inspect transcript)
+    speakers_parser = subparsers.add_parser("speakers", help="List speakers in transcript")
+    speakers_parser.add_argument("transcript", help="Transcript JSON file")
+    speakers_parser.set_defaults(func=cmd_speakers)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
