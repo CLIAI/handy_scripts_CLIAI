@@ -66,6 +66,7 @@ echo
 if $RUN_UNIT; then
   echo "=== Unit Tests (No API) ==="
   run_test "cli_unit_tests" "${SCRIPT_DIR}/test_cli.py"
+  run_test "samples_and_trust_tests" "${SCRIPT_DIR}/test_samples_and_trust.py"
   echo
 fi
 

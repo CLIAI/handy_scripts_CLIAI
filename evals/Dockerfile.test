@@ -25,29 +25,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install b3sum (blake3 hasher)
-# Using prebuilt binary for speed
-RUN curl -sSL https://github.com/BLAKE3-team/BLAKE3/releases/download/1.5.0/b3sum_linux_x64_bin \
-    -o /usr/local/bin/b3sum \
-    && chmod +x /usr/local/bin/b3sum
+# Note: b3sum (blake3) is optional - code falls back to sha256 if unavailable
+# Skip b3sum installation to speed up builds (tests work without it)
 
 # Python dependencies
 WORKDIR /app
 
-# Copy requirements first for layer caching
-COPY requirements*.txt ./
+# Install Python packages
 RUN pip install --no-cache-dir pyyaml requests
 
 # Copy tools (order: least to most frequently changed)
 COPY speaker_detection_backends/ ./speaker_detection_backends/
 COPY speaker_detection speaker_samples ./
-COPY stt_speechmatics.py stt_assemblyai_speaker_mapper.py ./
+COPY stt_speechmatics.py ./
 
 # Copy test infrastructure
 COPY evals/ ./evals/
 
 # Make scripts executable
-RUN chmod +x speaker_detection speaker_samples
+RUN chmod +x speaker_detection speaker_samples evals/speaker_detection/*.py evals/speaker_detection/*.sh
 
 # Test-specific environment - CRITICAL for isolation
 ENV SPEAKERS_EMBEDDINGS_DIR=/tmp/test_speakers
@@ -61,9 +57,13 @@ RUN mkdir -p /tmp/test_speakers
 # Verify installation
 RUN espeak-ng --version && \
     ffmpeg -version | head -1 && \
-    b3sum --version && \
-    python3 -c "import yaml; print('PyYAML OK')"
+    python3 -c "import yaml; print('PyYAML OK')" && \
+    ./speaker_detection --help > /dev/null && \
+    ./speaker_samples --help > /dev/null
 
-# Default: run all tests
-WORKDIR /app/evals/speaker_detection
-CMD ["bash", "-c", "make all && ./test_all.sh"]
+# Generate test audio at build time
+RUN cd evals/speaker_detection && make all
+
+# Default: run all unit tests
+WORKDIR /app
+CMD ["./evals/speaker_detection/test_all.sh", "--unit"]
