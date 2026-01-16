@@ -46,7 +46,7 @@ except ImportError:
 # ----------------------------------------------------------------------
 
 DEFAULT_DB_DIR = os.path.expanduser("~/.config/speakers_embeddings")
-METADATA_VERSION = 1
+METADATA_VERSION = 2  # v2: Added b3sum, review fields
 
 
 def get_db_dir() -> Path:
@@ -226,13 +226,29 @@ def extract_segments_from_transcript(
 # Audio Extraction
 # ----------------------------------------------------------------------
 
-def compute_file_hash(file_path: Path, algorithm: str = "sha256") -> str:
-    """Compute hash of file contents."""
-    h = hashlib.new(algorithm)
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return f"{algorithm}:{h.hexdigest()}"
+def compute_b3sum(file_path: Path) -> str:
+    """
+    Compute blake3 hash of file contents using b3sum CLI.
+
+    Returns first 32 chars (128 bits) for reasonable uniqueness.
+    Falls back to sha256 if b3sum not available.
+    """
+    try:
+        result = subprocess.run(
+            ["b3sum", "--no-names", str(file_path)],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        # Return first 32 chars (128 bits) - plenty for uniqueness
+        return result.stdout.strip()[:32]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to sha256 if b3sum not available
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()[:32]
 
 
 def extract_audio_segment(
@@ -307,19 +323,21 @@ def get_next_sample_id(speaker_dir: Path) -> str:
 def write_metadata(
     meta_path: Path,
     sample_id: str,
+    sample_b3sum: str,
     audio_path: Path,
-    audio_hash: str,
+    audio_b3sum: str,
     transcript_path: Optional[Path],
     segment: Dict[str, Any],
     speaker_label: str,
 ) -> None:
-    """Write sample metadata YAML file."""
+    """Write sample metadata YAML file (v2 schema with b3sum and review)."""
     meta = {
         "version": METADATA_VERSION,
         "sample_id": sample_id,
+        "b3sum": sample_b3sum,  # Blake3 hash of THIS sample audio
         "source": {
             "audio_file": str(audio_path.resolve()),
-            "audio_hash": audio_hash,
+            "audio_b3sum": audio_b3sum,  # Blake3 of source recording
         },
         "segment": {
             "speaker_label": speaker_label,
@@ -330,8 +348,13 @@ def write_metadata(
         },
         "extraction": {
             "tool": "speaker_samples",
-            "tool_version": "1.0.0",
+            "tool_version": "1.1.0",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "review": {
+            "status": "pending",  # pending | reviewed | rejected
+            "reviewed_at": None,
+            "notes": None,
         },
     }
 
@@ -421,8 +444,8 @@ def cmd_extract(args) -> int:
     speaker_id = args.speaker_id
     speaker_dir = ensure_speaker_samples_dir(speaker_id)
 
-    # Compute audio hash once
-    audio_hash = compute_file_hash(audio_path)
+    # Compute source audio b3sum once
+    audio_b3sum = compute_b3sum(audio_path)
 
     # Extract each segment
     extracted = 0
@@ -437,10 +460,15 @@ def cmd_extract(args) -> int:
             continue
 
         if extract_audio_segment(audio_path, output_path, seg["start"], seg["end"], output_format):
-            write_metadata(meta_path, sample_id, audio_path, audio_hash, transcript_path, seg, speaker_label)
+            # Compute b3sum of extracted sample
+            sample_b3sum = compute_b3sum(output_path)
+            write_metadata(
+                meta_path, sample_id, sample_b3sum,
+                audio_path, audio_b3sum, transcript_path, seg, speaker_label
+            )
             extracted += 1
             if args.verbose:
-                print(f"Extracted: {sample_id} ({seg['start']:.2f}-{seg['end']:.2f}s)")
+                print(f"Extracted: {sample_id} ({seg['start']:.2f}-{seg['end']:.2f}s) b3sum:{sample_b3sum[:8]}")
         else:
             print(f"Failed to extract segment {seg['start']:.2f}-{seg['end']:.2f}s", file=sys.stderr)
 
@@ -510,31 +538,57 @@ def cmd_list(args) -> int:
 
         samples = sorted(speaker_dir.glob("sample-*.mp3")) + sorted(speaker_dir.glob("sample-*.wav"))
 
+        # Load metadata and optionally filter by status
+        sample_data = []
+        for sample in samples:
+            meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+            meta = load_sample_metadata(meta_path) or {}
+
+            # Get review status
+            review_status = meta.get("review", {}).get("status", "pending")
+
+            # Filter by status if specified
+            if args.status and review_status != args.status:
+                continue
+
+            sample_data.append({
+                "path": sample,
+                "meta": meta,
+                "review_status": review_status,
+            })
+
         if args.format == "json":
             output = []
-            for sample in samples:
-                meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
-                meta = {}
-                if meta_path.exists() and YAML_AVAILABLE:
-                    with open(meta_path) as f:
-                        meta = yaml.safe_load(f)
-                output.append({
-                    "sample_id": sample.stem,
-                    "file": str(sample),
+            for item in sample_data:
+                meta = item["meta"]
+                entry = {
+                    "sample_id": item["path"].stem,
+                    "file": str(item["path"]),
+                    "b3sum": meta.get("b3sum"),
                     "duration": meta.get("segment", {}).get("duration_sec"),
                     "text": meta.get("segment", {}).get("text", "")[:50],
-                })
+                    "review_status": item["review_status"],
+                }
+                output.append(entry)
             print(json.dumps(output, indent=2))
         else:
+            if not sample_data:
+                status_msg = f" with status '{args.status}'" if args.status else ""
+                print(f"No samples found for {args.speaker_id}{status_msg}")
+                return 0
+
             print(f"Samples for {args.speaker_id}:")
-            for sample in samples:
-                meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
-                duration = "?"
-                if meta_path.exists() and YAML_AVAILABLE:
-                    with open(meta_path) as f:
-                        meta = yaml.safe_load(f)
-                        duration = f"{meta.get('segment', {}).get('duration_sec', '?'):.1f}s"
-                print(f"  {sample.stem}  {duration}  {sample.suffix}")
+            for item in sample_data:
+                meta = item["meta"]
+                duration = meta.get("segment", {}).get("duration_sec", 0)
+                duration_str = f"{duration:.1f}s" if duration else "?"
+
+                if args.show_review or args.status:
+                    status = item["review_status"]
+                    status_icon = {"pending": "○", "reviewed": "✓", "rejected": "✗"}.get(status, "?")
+                    print(f"  {item['path'].stem}  {duration_str:>6}  {status_icon} {status}")
+                else:
+                    print(f"  {item['path'].stem}  {duration_str:>6}  {item['path'].suffix}")
     else:
         # List all speakers with sample counts
         speakers = []
@@ -543,16 +597,26 @@ def cmd_list(args) -> int:
                 samples = list(speaker_path.glob("sample-*.mp3")) + list(speaker_path.glob("sample-*.wav"))
                 if samples:
                     total_dur = 0
+                    counts = {"pending": 0, "reviewed": 0, "rejected": 0}
                     for sample in samples:
                         meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
-                        if meta_path.exists() and YAML_AVAILABLE:
-                            with open(meta_path) as f:
-                                meta = yaml.safe_load(f)
-                                total_dur += meta.get("segment", {}).get("duration_sec", 0)
+                        meta = load_sample_metadata(meta_path) or {}
+                        total_dur += meta.get("segment", {}).get("duration_sec", 0)
+                        status = meta.get("review", {}).get("status", "pending")
+                        counts[status] = counts.get(status, 0) + 1
+
+                    # Filter by status if specified
+                    if args.status:
+                        if counts.get(args.status, 0) == 0:
+                            continue
+
                     speakers.append({
                         "id": speaker_path.name,
                         "count": len(samples),
                         "duration": total_dur,
+                        "pending": counts["pending"],
+                        "reviewed": counts["reviewed"],
+                        "rejected": counts["rejected"],
                     })
 
         if args.format == "json":
@@ -561,10 +625,16 @@ def cmd_list(args) -> int:
             if not speakers:
                 print("No samples found.")
             else:
-                print(f"{'Speaker':<20} {'Samples':>8} {'Duration':>10}")
-                print("-" * 40)
-                for s in speakers:
-                    print(f"{s['id']:<20} {s['count']:>8} {s['duration']:>9.1f}s")
+                if args.show_review:
+                    print(f"{'Speaker':<16} {'Samples':>7} {'Duration':>9} {'Pending':>8} {'Reviewed':>8} {'Rejected':>8}")
+                    print("-" * 65)
+                    for s in speakers:
+                        print(f"{s['id']:<16} {s['count']:>7} {s['duration']:>8.1f}s {s['pending']:>8} {s['reviewed']:>8} {s['rejected']:>8}")
+                else:
+                    print(f"{'Speaker':<20} {'Samples':>8} {'Duration':>10}")
+                    print("-" * 40)
+                    for s in speakers:
+                        print(f"{s['id']:<20} {s['count']:>8} {s['duration']:>9.1f}s")
 
     return 0
 
@@ -698,6 +768,110 @@ def cmd_speakers(args) -> int:
     return 0
 
 
+def load_sample_metadata(meta_path: Path) -> Optional[Dict[str, Any]]:
+    """Load sample metadata, handling both YAML and JSON formats."""
+    if meta_path.exists() and YAML_AVAILABLE:
+        with open(meta_path) as f:
+            return yaml.safe_load(f)
+    # Try JSON fallback
+    json_path = meta_path.with_suffix(".json")
+    if json_path.exists():
+        with open(json_path) as f:
+            return json.load(f)
+    return None
+
+
+def save_sample_metadata(meta_path: Path, meta: Dict[str, Any]) -> None:
+    """Save sample metadata to YAML (or JSON fallback)."""
+    if YAML_AVAILABLE:
+        with open(meta_path, "w") as f:
+            yaml.dump(meta, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    else:
+        with open(meta_path.with_suffix(".json"), "w") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+def cmd_review(args) -> int:
+    """Review samples - approve or reject."""
+    speaker_dir = get_speaker_samples_dir(args.speaker_id)
+
+    if not speaker_dir.exists():
+        print(f"Error: No samples found for speaker '{args.speaker_id}'", file=sys.stderr)
+        return 1
+
+    # Find samples to review
+    samples_to_review = []
+
+    if args.sample_id:
+        # Single sample
+        for ext in [".mp3", ".wav"]:
+            sample_path = speaker_dir / f"{args.sample_id}{ext}"
+            if sample_path.exists():
+                samples_to_review.append(sample_path)
+                break
+        if not samples_to_review:
+            print(f"Error: Sample '{args.sample_id}' not found", file=sys.stderr)
+            return 1
+    elif args.source_b3sum:
+        # All samples from a specific source recording
+        all_samples = list(speaker_dir.glob("sample-*.mp3")) + list(speaker_dir.glob("sample-*.wav"))
+        for sample in all_samples:
+            meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+            meta = load_sample_metadata(meta_path)
+            if meta and meta.get("source", {}).get("audio_b3sum", "").startswith(args.source_b3sum):
+                samples_to_review.append(sample)
+        if not samples_to_review:
+            print(f"Error: No samples found from source b3sum '{args.source_b3sum}'", file=sys.stderr)
+            return 1
+    else:
+        print("Error: Specify sample_id or --source-b3sum", file=sys.stderr)
+        return 1
+
+    # Determine new status
+    if args.approve:
+        new_status = "reviewed"
+    elif args.reject:
+        new_status = "rejected"
+    else:
+        print("Error: Specify --approve or --reject", file=sys.stderr)
+        return 1
+
+    # Update each sample
+    updated = 0
+    for sample_path in samples_to_review:
+        meta_path = sample_path.with_suffix("").with_suffix(".meta.yaml")
+        meta = load_sample_metadata(meta_path)
+
+        if not meta:
+            print(f"Warning: No metadata for {sample_path.stem}", file=sys.stderr)
+            continue
+
+        # Ensure review section exists (for v1 samples)
+        if "review" not in meta:
+            meta["review"] = {"status": "pending", "reviewed_at": None, "notes": None}
+
+        old_status = meta["review"].get("status", "pending")
+        meta["review"]["status"] = new_status
+        meta["review"]["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        if args.notes:
+            meta["review"]["notes"] = args.notes
+
+        # Update version if needed
+        if meta.get("version", 1) < 2:
+            meta["version"] = 2
+
+        save_sample_metadata(meta_path, meta)
+        updated += 1
+
+        if len(samples_to_review) == 1 or args.verbose:
+            print(f"{sample_path.stem}: {old_status} -> {new_status}")
+
+    if len(samples_to_review) > 1 and not args.verbose:
+        print(f"Updated {updated} samples to '{new_status}'")
+
+    return 0
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -738,6 +912,8 @@ def main():
     list_parser = subparsers.add_parser("list", help="List stored samples")
     list_parser.add_argument("speaker_id", nargs="?", help="Speaker ID (optional)")
     list_parser.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+    list_parser.add_argument("--show-review", action="store_true", help="Show review status")
+    list_parser.add_argument("--status", choices=["pending", "reviewed", "rejected"], help="Filter by review status")
     list_parser.set_defaults(func=cmd_list)
 
     # info command
@@ -760,6 +936,17 @@ def main():
     speakers_parser = subparsers.add_parser("speakers", help="List speakers in transcript")
     speakers_parser.add_argument("transcript", help="Transcript JSON file")
     speakers_parser.set_defaults(func=cmd_speakers)
+
+    # review command
+    review_parser = subparsers.add_parser("review", help="Review samples (approve/reject)")
+    review_parser.add_argument("speaker_id", help="Speaker ID")
+    review_parser.add_argument("sample_id", nargs="?", help="Sample ID to review")
+    review_parser.add_argument("--source-b3sum", help="Review all samples from source with this b3sum prefix")
+    review_parser.add_argument("--approve", action="store_true", help="Mark as reviewed/approved")
+    review_parser.add_argument("--reject", action="store_true", help="Mark as rejected")
+    review_parser.add_argument("--notes", help="Review notes")
+    review_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    review_parser.set_defaults(func=cmd_review)
 
     args = parser.parse_args()
     return args.func(args)
