@@ -432,6 +432,7 @@ This enables continuous quality improvement: review samples as time permits, the
 
 ## See Also
 
+* [CONTRIBUTING.md](../CONTRIBUTING.md) - Coding guidelines and UNIX philosophy
 * [speaker_detection.README.md](../speaker_detection.README.md)
 * [speaker_samples.README.md](../speaker_samples.README.md)
 * [stt_speechmatics.README.md](../stt_speechmatics.README.md)
