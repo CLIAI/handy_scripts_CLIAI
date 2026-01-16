@@ -63,6 +63,8 @@ Requirements:
 ./speaker_detection list --format json      # JSON output
 ./speaker_detection list --format ids       # IDs only
 ./speaker_detection list --tags podcast     # Filter by tag
+./speaker_detection list --limit 10         # Pagination: first 10
+./speaker_detection list --offset 5 --limit 5  # Skip 5, show next 5
 
 # Show speaker details
 ./speaker_detection show alice
@@ -99,9 +101,20 @@ Requirements:
 # List embeddings for a speaker
 ./speaker_detection embeddings alice
 ./speaker_detection embeddings alice --backend speechmatics
+./speaker_detection embeddings alice --show-trust  # Show trust level and sample counts
 
 # Remove an embedding
 ./speaker_detection remove-embedding alice emb-abc12345
+
+# Check embedding validity (based on sample review states)
+./speaker_detection check-validity              # All speakers
+./speaker_detection check-validity alice        # Specific speaker
+./speaker_detection check-validity -v           # Verbose (show all embeddings)
+
+# Validate schema of profiles and embeddings
+./speaker_detection validate                    # All speakers
+./speaker_detection validate alice              # Specific speaker
+./speaker_detection validate --strict           # Non-zero exit on warnings
 ```
 
 ### Detection/Identification
@@ -211,7 +224,9 @@ Requirements:
 |----------|---------|-------------|
 | `SPEAKERS_EMBEDDINGS_DIR` | `~/.config/speakers_embeddings` | Database location |
 | `SPEAKER_DETECTION_BACKEND` | `speechmatics` | Default backend |
+| `SPEAKER_BACKENDS_CONFIG` | `speaker_detection_backends/backends.yaml` | Backend registry config |
 | `SPEECHMATICS_API_KEY` | - | Speechmatics API key |
+| `SPEAKER_DETECTION_DEBUG` | - | Enable debug logging |
 
 ## Best Practices
 
@@ -248,8 +263,26 @@ make all
 ./benchmark.py --dry-run
 ```
 
+## Shell Completions
+
+Tab-completion scripts are available for bash, zsh, and fish:
+
+```bash
+# Bash - add to ~/.bashrc
+source completions/bash/speaker_detection.bash
+
+# Zsh - add to fpath in ~/.zshrc
+fpath=(completions/zsh $fpath)
+autoload -Uz compinit && compinit
+
+# Fish - symlink to completions directory
+ln -s completions/fish/speaker_detection.fish ~/.config/fish/completions/
+```
+
 ## Related Tools
 
-* `stt_speechmatics.py` - Speech-to-text with speaker diarization
-* `stt_assemblyai.py` - AssemblyAI transcription
-* `stt_speechmatics_speaker_mapper.py` - Map speaker labels to names
+* [`speaker_samples`](./speaker_samples.README.md) - Voice sample extraction with provenance
+* [`speaker_segments`](./speaker_segments.README.md) - Extract segment timestamps from transcripts
+* [`stt_speechmatics.py`](./stt_speechmatics.README.md) - Speech-to-text with speaker diarization
+* [`stt_assemblyai.py`](./stt_assemblyai.README.md) - AssemblyAI transcription
+* [`stt_speechmatics_speaker_mapper.py`](./stt_speechmatics_speaker_mapper.README.md) - Map speaker labels to names

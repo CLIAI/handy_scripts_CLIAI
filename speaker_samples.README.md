@@ -123,6 +123,16 @@ Example - pipe to enrollment:
 # JSON output
 ./speaker_samples list --format json
 ./speaker_samples list alice --format json
+
+# Show review status
+./speaker_samples list alice --show-review
+./speaker_samples list alice --status pending    # Filter by status
+./speaker_samples list alice --status reviewed
+./speaker_samples list alice --status rejected
+
+# Pagination
+./speaker_samples list --limit 10               # First 10 speakers
+./speaker_samples list alice --limit 5 --offset 10  # Skip 10, show 5
 ```
 
 ### `info` - Show sample metadata
@@ -160,6 +170,31 @@ Example - pipe to enrollment:
 # Speakers: S1, S2, S3
 ```
 
+### `review` - Review samples (approve/reject)
+
+Mark samples as reviewed/approved or rejected for trust level computation:
+
+```bash
+# Approve a specific sample
+./speaker_samples review alice sample-001 --approve
+
+# Reject a sample with notes
+./speaker_samples review alice sample-001 --reject --notes "Wrong speaker detected"
+
+# Approve all samples from a source recording (by b3sum prefix)
+./speaker_samples review alice --source-b3sum abc123 --approve
+
+# Verbose output
+./speaker_samples review alice sample-001 --approve -v
+```
+
+Review status affects embedding trust levels:
+
+* **high** - All source samples reviewed/approved
+* **medium** - Mix of reviewed and unreviewed samples
+* **low** - All samples unreviewed
+* **invalidated** - Any sample rejected
+
 ## Storage Structure
 
 Samples are stored under `$SPEAKERS_EMBEDDINGS_DIR/samples/`:
@@ -183,23 +218,34 @@ $SPEAKERS_EMBEDDINGS_DIR/
 Each sample has a `.meta.yaml` sidecar file with full provenance:
 
 ```yaml
-version: 1
+version: 2
 sample_id: sample-001
+b3sum: abc123def456...           # Blake3 hash of this sample audio
+
 source:
   audio_file: /path/to/meeting.mp3
-  audio_hash: sha256:abc123...
+  audio_b3sum: xyz789...         # Blake3 hash of source recording
   transcript_file: /path/to/meeting.speechmatics.json
+
 segment:
   speaker_label: S1
   start_sec: 10.5
   end_sec: 25.3
   duration_sec: 14.8
   text: "transcribed text..."
+
 extraction:
   tool: speaker_samples
-  tool_version: 1.0.0
+  tool_version: 1.1.0
   extracted_at: 2026-01-12T10:30:00Z
+
+review:
+  status: pending                # pending | reviewed | rejected
+  reviewed_at: null
+  notes: null
 ```
+
+The `b3sum` field enables content-addressable sample tracking for embedding provenance.
 
 ## Supported Transcript Formats
 
@@ -280,9 +326,26 @@ extraction:
 ./stt_speechmatics.py new_meeting.mp3 --speakers-tag work
 ```
 
+## Shell Completions
+
+Tab-completion scripts are available for bash, zsh, and fish:
+
+```bash
+# Bash - add to ~/.bashrc
+source completions/bash/speaker_samples.bash
+
+# Zsh - add to fpath in ~/.zshrc
+fpath=(completions/zsh $fpath)
+autoload -Uz compinit && compinit
+
+# Fish - symlink to completions directory
+ln -s completions/fish/speaker_samples.fish ~/.config/fish/completions/
+```
+
 ## Related Tools
 
 * [`speaker_detection`](./speaker_detection.README.md) - Speaker profile and embedding management
+* [`speaker_segments`](./speaker_segments.README.md) - Extract segment timestamps (lightweight alternative)
 * [`stt_speechmatics.py`](./stt_speechmatics.README.md) - Speechmatics STT with speaker identification
 * [`stt_assemblyai_speaker_mapper.py`](./stt_assemblyai_speaker_mapper.README.md) - AssemblyAI speaker mapping
 
