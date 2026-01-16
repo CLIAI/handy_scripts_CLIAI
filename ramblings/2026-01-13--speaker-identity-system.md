@@ -161,22 +161,31 @@ $SPEAKERS_EMBEDDINGS_DIR/           # Default: ~/.config/speakers_embeddings
 ## Sample Metadata Schema
 
 ```yaml
-version: 1
+version: 2
 sample_id: sample-001
+b3sum: abc123def456...                 # Blake3 hash of THIS sample audio
+
 source:
   audio_file: /path/to/meeting.mp3
-  audio_hash: sha256:abc123...
+  audio_b3sum: xyz789...               # Blake3 of source recording
   transcript_file: /path/to/meeting.speechmatics.json
+
 segment:
   speaker_label: S1
   start_sec: 10.5
   end_sec: 25.3
   duration_sec: 14.8
   text: "transcribed speech content..."
+
 extraction:
   tool: speaker_samples
-  tool_version: 1.0.0
+  tool_version: 1.1.0
   extracted_at: 2026-01-12T10:30:00Z
+
+review:
+  status: pending                      # pending | reviewed | rejected
+  reviewed_at: null
+  notes: null
 ```
 
 ## Typical Workflows
@@ -336,7 +345,90 @@ graph TB
 
 # STT with speaker identification
 ./stt_speechmatics.py <audio> --speakers-tag <tag> [--speaker-id id1,id2]
+
+# Review workflow
+./speaker_samples review <speaker_id> <sample_id> --approve|--reject [--notes "..."]
+./speaker_samples list <speaker_id> --show-review --status pending|reviewed|rejected
+
+# Trust level verification
+./speaker_detection embeddings <id> --show-trust
+./speaker_detection check-validity [speaker_id]
 ```
+
+## Review State and Trust Levels
+
+Diarization produces many samples from recordings. Users may not review all samples immediately but want to use them for embeddings. The review/trust system tracks sample quality.
+
+### Sample Review States
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: Sample extracted (b3sum computed)
+    pending --> reviewed: Approve
+    pending --> rejected: Reject
+    reviewed --> rejected: Error found
+    rejected --> reviewed: Mistake corrected
+```
+
+Each sample has a review status stored in its `.meta.yaml`:
+
+```yaml
+review:
+  status: pending | reviewed | rejected
+  reviewed_at: 2026-01-15T10:30:00Z
+  notes: "confirmed correct speaker"
+```
+
+### Content-Addressable Tracking with Blake3
+
+Samples are identified by their blake3 hash (`b3sum`). This enables:
+
+* **Content verification** - detect if audio was modified
+* **Provenance tracking** - link embeddings to exact source samples
+* **Trust computation** - aggregate sample states into embedding confidence
+
+### Trust Level Hierarchy
+
+Embeddings store which samples (by b3sum) were used during enrollment:
+
+```json
+{
+  "id": "emb-abc12345",
+  "samples": {
+    "reviewed": ["abc123...", "def456..."],
+    "unreviewed": ["789xyz..."],
+    "rejected": []
+  },
+  "trust_level": "medium"
+}
+```
+
+Trust levels computed from sample lists:
+
+| Level | Criteria | Use Case |
+|-------|----------|----------|
+| **HIGH** | All samples reviewed, none rejected | Critical identification |
+| **MEDIUM** | Mix of reviewed + unreviewed, none rejected | General use |
+| **LOW** | All samples unreviewed | Exploration only |
+| **INVALIDATED** | Any sample rejected | Needs re-enrollment |
+
+### Invalidation Detection
+
+When samples are later rejected, embeddings become invalid:
+
+```bash
+# Check all embeddings against current sample states
+./speaker_detection check-validity
+
+# Sample output:
+# INVALIDATED: alice/speechmatics/emb-abc12345
+#   Newly rejected samples: abc123...
+#
+# Checked 5 embeddings across 2 speakers
+#   1 INVALIDATED (re-enrollment needed)
+```
+
+This enables continuous quality improvement: review samples as time permits, then re-enroll speakers whose embeddings are now suspect.
 
 ## See Also
 
