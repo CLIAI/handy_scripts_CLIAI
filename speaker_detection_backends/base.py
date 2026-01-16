@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 import importlib
 
+# Import transcript parsing functions
+from speaker_detection_backends.transcript import (
+    extract_segments_as_tuples,
+    load_transcript,
+)
+
 
 class EmbeddingBackend(ABC):
     """Abstract base class for speaker embedding backends."""
@@ -123,55 +129,8 @@ class EmbeddingBackend(ABC):
         Returns:
             List of (start_sec, end_sec) tuples
         """
-        import json
-
-        with open(transcript_path) as f:
-            data = json.load(f)
-
-        segments = []
-
-        # Try AssemblyAI format (utterances array)
-        if "utterances" in data:
-            for utt in data["utterances"]:
-                if utt.get("speaker") == speaker_label:
-                    start = utt.get("start", 0) / 1000.0  # ms to sec
-                    end = utt.get("end", 0) / 1000.0
-                    segments.append((start, end))
-
-        # Try Speechmatics format (results array with speaker field)
-        elif "results" in data:
-            current_start = None
-            current_end = None
-            current_speaker = None
-
-            for item in data["results"]:
-                if item.get("type") != "word":
-                    continue
-
-                speaker = item.get("speaker", "UU")
-                start = item.get("start_time", 0)
-                end = item.get("end_time", 0)
-
-                if speaker == speaker_label:
-                    if current_speaker != speaker_label:
-                        # New segment starts
-                        if current_start is not None and current_speaker == speaker_label:
-                            segments.append((current_start, current_end))
-                        current_start = start
-                    current_end = end
-                    current_speaker = speaker_label
-                else:
-                    # Speaker changed
-                    if current_speaker == speaker_label and current_start is not None:
-                        segments.append((current_start, current_end))
-                        current_start = None
-                    current_speaker = speaker
-
-            # Don't forget last segment
-            if current_speaker == speaker_label and current_start is not None:
-                segments.append((current_start, current_end))
-
-        return segments
+        data = load_transcript(transcript_path)
+        return extract_segments_as_tuples(data, speaker_label)
 
 
 # Registry of available backends

@@ -41,6 +41,17 @@ try:
 except ImportError:
     YAML_AVAILABLE = False
 
+# Try to import consolidated transcript parsing
+try:
+    from speaker_detection_backends.transcript import (
+        detect_transcript_format as _detect_transcript_format,
+        get_available_speakers as _get_available_speakers,
+        extract_segments_from_transcript as _extract_segments_from_transcript,
+    )
+    TRANSCRIPT_MODULE_AVAILABLE = True
+except ImportError:
+    TRANSCRIPT_MODULE_AVAILABLE = False
+
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
@@ -82,6 +93,11 @@ def detect_transcript_format(data: Dict[str, Any]) -> str:
     Returns:
         'assemblyai', 'speechmatics', or 'unknown'
     """
+    # Use consolidated module if available
+    if TRANSCRIPT_MODULE_AVAILABLE:
+        return _detect_transcript_format(data)
+
+    # Fallback implementation
     if "utterances" in data:
         return "assemblyai"
     if "results" in data and isinstance(data.get("results"), list):
@@ -95,6 +111,11 @@ def detect_transcript_format(data: Dict[str, Any]) -> str:
 
 def get_available_speakers(data: Dict[str, Any]) -> List[str]:
     """Get list of speaker labels in transcript."""
+    # Use consolidated module if available
+    if TRANSCRIPT_MODULE_AVAILABLE:
+        return _get_available_speakers(data)
+
+    # Fallback implementation
     fmt = detect_transcript_format(data)
     speakers = set()
 
@@ -135,6 +156,11 @@ def extract_segments_from_transcript(
     Returns:
         List of segment dicts with start, end, text
     """
+    # Use consolidated module if available
+    if TRANSCRIPT_MODULE_AVAILABLE:
+        return _extract_segments_from_transcript(data, speaker_label, min_duration, max_gap)
+
+    # Fallback implementation
     fmt = detect_transcript_format(data)
     raw_segments = []
 
