@@ -407,6 +407,154 @@ def test_error_handling(temp_dir: Path) -> TestResult:
     return result
 
 
+def test_enroll_dry_run(temp_dir: Path) -> TestResult:
+    """Test enroll command with --dry-run flag (no API calls)."""
+    result = TestResult("enroll_dry_run")
+    env = {"SPEAKERS_EMBEDDINGS_DIR": str(temp_dir)}
+
+    # Add speaker first
+    rc, _, stderr = run_cmd(["add", "enroll-test", "--name", "Enroll Test"], env)
+    if rc != 0:
+        result.error = f"add failed: {stderr}"
+        return result
+
+    # Create a dummy audio file
+    audio_file = temp_dir / "test_audio.wav"
+    audio_file.write_bytes(b"dummy audio data")
+
+    # Test enroll with --dry-run and --segments
+    rc, stdout, stderr = run_cmd([
+        "enroll", "enroll-test", str(audio_file),
+        "--segments", "10.5:25.3,30.0:45.5",
+        "--dry-run",
+    ], env)
+
+    if rc != 0:
+        result.error = f"enroll --dry-run failed: {stderr}"
+        return result
+
+    # Check output contains expected info
+    if "Would enroll speaker" not in stdout:
+        result.error = f"Dry-run output missing expected text: {stdout}"
+        return result
+
+    if "enroll-test" not in stdout:
+        result.error = f"Dry-run output missing speaker ID: {stdout}"
+        return result
+
+    if "Segments: 2" not in stdout:
+        result.error = f"Dry-run output missing segment count: {stdout}"
+        return result
+
+    result.passed = True
+    return result
+
+
+def test_enroll_from_stdin_dry_run(temp_dir: Path) -> TestResult:
+    """Test enroll --from-stdin with dry-run (no API calls)."""
+    result = TestResult("enroll_from_stdin")
+    env = {"SPEAKERS_EMBEDDINGS_DIR": str(temp_dir)}
+
+    # Add speaker first
+    rc, _, stderr = run_cmd(["add", "stdin-test", "--name", "Stdin Test"], env)
+    if rc != 0:
+        result.error = f"add failed: {stderr}"
+        return result
+
+    # Create a dummy audio file
+    audio_file = temp_dir / "test_audio.wav"
+    audio_file.write_bytes(b"dummy audio data")
+
+    # Test enroll with --from-stdin and --dry-run
+    # Need to provide input via stdin
+    jsonl_input = '{"start": 5.0, "end": 10.5, "text": "Hello"}\n{"start": 15.0, "end": 20.0, "text": "World"}\n'
+
+    cmd = [str(SPEAKER_DETECTION), "enroll", "stdin-test", str(audio_file), "--from-stdin", "--dry-run"]
+    full_env = os.environ.copy()
+    full_env.update(env)
+
+    proc = subprocess.run(
+        cmd,
+        input=jsonl_input,
+        capture_output=True,
+        text=True,
+        env=full_env,
+    )
+
+    if proc.returncode != 0:
+        result.error = f"enroll --from-stdin failed: {proc.stderr}"
+        return result
+
+    # Check output
+    if "Would enroll speaker" not in proc.stdout:
+        result.error = f"Output missing expected text: {proc.stdout}"
+        return result
+
+    if "Segments: 2" not in proc.stdout:
+        result.error = f"Output missing segment count: {proc.stdout}"
+        return result
+
+    # Check stderr shows segments read
+    if "Read 2 segments from stdin" not in proc.stderr:
+        result.error = f"Stderr missing read confirmation: {proc.stderr}"
+        return result
+
+    result.passed = True
+    return result
+
+
+def test_enroll_from_transcript_dry_run(temp_dir: Path) -> TestResult:
+    """Test enroll --from-transcript with dry-run (no API calls)."""
+    result = TestResult("enroll_from_transcript")
+    env = {"SPEAKERS_EMBEDDINGS_DIR": str(temp_dir)}
+
+    # Add speaker first
+    rc, _, stderr = run_cmd(["add", "transcript-test", "--name", "Transcript Test"], env)
+    if rc != 0:
+        result.error = f"add failed: {stderr}"
+        return result
+
+    # Create a dummy audio file
+    audio_file = temp_dir / "test_audio.wav"
+    audio_file.write_bytes(b"dummy audio data")
+
+    # Create a mock AssemblyAI transcript
+    transcript_file = temp_dir / "transcript.json"
+    transcript_data = {
+        "utterances": [
+            {"speaker": "A", "start": 1000, "end": 5000, "text": "Hello"},
+            {"speaker": "B", "start": 6000, "end": 10000, "text": "Hi there"},
+            {"speaker": "A", "start": 11000, "end": 15000, "text": "How are you?"},
+        ]
+    }
+    with open(transcript_file, "w") as f:
+        json.dump(transcript_data, f)
+
+    # Test enroll with --from-transcript
+    rc, stdout, stderr = run_cmd([
+        "enroll", "transcript-test", str(audio_file),
+        "--from-transcript", str(transcript_file),
+        "--speaker-label", "A",
+        "--dry-run",
+    ], env)
+
+    if rc != 0:
+        result.error = f"enroll --from-transcript failed: {stderr}"
+        return result
+
+    # Check output
+    if "Would enroll speaker" not in stdout:
+        result.error = f"Output missing expected text: {stdout}"
+        return result
+
+    if "Segments: 2" not in stdout:
+        result.error = f"Output missing segment count (should be 2 for speaker A): {stdout}"
+        return result
+
+    result.passed = True
+    return result
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="speaker_detection CLI unit tests")
@@ -424,6 +572,9 @@ def main():
         test_query,
         test_name_context,
         test_error_handling,
+        test_enroll_dry_run,
+        test_enroll_from_stdin_dry_run,
+        test_enroll_from_transcript_dry_run,
     ]
 
     print("speaker_detection CLI Unit Tests")
