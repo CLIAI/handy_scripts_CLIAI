@@ -339,6 +339,8 @@ def test_trust_level_computation(temp_dir: Path) -> TestResult:
     """Test trust level computation logic."""
     result = TestResult("trust_level_computation")
 
+    # Save and restore environment to avoid pollution
+    old_env = os.environ.get("SPEAKERS_EMBEDDINGS_DIR")
     os.environ["SPEAKERS_EMBEDDINGS_DIR"] = str(temp_dir)
 
     try:
@@ -380,6 +382,13 @@ def test_trust_level_computation(temp_dir: Path) -> TestResult:
     except ImportError as e:
         result.error = f"Failed to import speaker_detection: {e}"
 
+    finally:
+        # Restore environment
+        if old_env is None:
+            os.environ.pop("SPEAKERS_EMBEDDINGS_DIR", None)
+        else:
+            os.environ["SPEAKERS_EMBEDDINGS_DIR"] = old_env
+
     return result
 
 
@@ -387,6 +396,8 @@ def test_b3sum_computation(temp_dir: Path) -> TestResult:
     """Test b3sum computation function."""
     result = TestResult("b3sum_computation")
 
+    # Save and restore environment to avoid pollution
+    old_env = os.environ.get("SPEAKERS_EMBEDDINGS_DIR")
     os.environ["SPEAKERS_EMBEDDINGS_DIR"] = str(temp_dir)
 
     try:
@@ -423,6 +434,13 @@ def test_b3sum_computation(temp_dir: Path) -> TestResult:
 
     except ImportError as e:
         result.error = f"Failed to import: {e}"
+
+    finally:
+        # Restore environment
+        if old_env is None:
+            os.environ.pop("SPEAKERS_EMBEDDINGS_DIR", None)
+        else:
+            os.environ["SPEAKERS_EMBEDDINGS_DIR"] = old_env
 
     return result
 
