@@ -1,0 +1,31 @@
+# Speaker Detection Backend Registry
+#
+# This file defines available speaker embedding backends.
+# Each backend entry maps a name to its module path.
+#
+# To add a custom backend:
+# 1. Create a module with a Backend class implementing EmbeddingBackend
+# 2. Add an entry here with the module path
+#
+# Format:
+#   backend_name:
+#     module: module.path.to.backend
+#     description: Optional description
+#     requires_api_key: true/false (informational)
+
+backends:
+  speechmatics:
+    module: speaker_detection_backends.speechmatics_backend
+    description: Speechmatics Batch API for speaker identification
+    requires_api_key: true
+
+  # Future backends (uncomment when implemented):
+  # pyannote:
+  #   module: speaker_detection_backends.pyannote_backend
+  #   description: Pyannote local speaker diarization
+  #   requires_api_key: false
+  #
+  # speechbrain:
+  #   module: speaker_detection_backends.speechbrain_backend
+  #   description: SpeechBrain ECAPA-TDNN embeddings
+  #   requires_api_key: false

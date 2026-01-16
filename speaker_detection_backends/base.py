@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 import importlib
+import os
 
 # Import transcript parsing functions
 from speaker_detection_backends.transcript import (
@@ -172,13 +173,73 @@ class EmbeddingBackend(ABC):
         return extract_segments_as_tuples(data, speaker_label)
 
 
-# Registry of available backends
-BACKENDS = {
+# Default backend registry (used if config file not found)
+_DEFAULT_BACKENDS = {
     "speechmatics": "speaker_detection_backends.speechmatics_backend",
-    # Future backends:
-    # "pyannote": "speaker_detection_backends.pyannote_backend",
-    # "speechbrain": "speaker_detection_backends.speechbrain_backend",
 }
+
+# Cached loaded backends
+_LOADED_BACKENDS: Optional[Dict[str, str]] = None
+
+
+def _load_backends_config() -> Dict[str, str]:
+    """
+    Load backend registry from config file or use defaults.
+
+    Config file locations (in order of precedence):
+    1. $SPEAKER_BACKENDS_CONFIG (if set)
+    2. speaker_detection_backends/backends.yaml (relative to this file)
+
+    Returns:
+        Dict mapping backend names to module paths
+    """
+    global _LOADED_BACKENDS
+
+    if _LOADED_BACKENDS is not None:
+        return _LOADED_BACKENDS
+
+    config_path = None
+
+    # Check environment variable
+    env_path = os.environ.get("SPEAKER_BACKENDS_CONFIG")
+    if env_path:
+        config_path = Path(env_path)
+        if not config_path.exists():
+            import sys
+            print(f"Warning: SPEAKER_BACKENDS_CONFIG not found: {config_path}", file=sys.stderr)
+            config_path = None
+
+    # Check default location
+    if config_path is None:
+        default_path = Path(__file__).parent / "backends.yaml"
+        if default_path.exists():
+            config_path = default_path
+
+    # Load config or use defaults
+    if config_path:
+        try:
+            import yaml
+            with open(config_path) as f:
+                data = yaml.safe_load(f)
+
+            backends = {}
+            for name, info in data.get("backends", {}).items():
+                if isinstance(info, dict):
+                    backends[name] = info.get("module", "")
+                elif isinstance(info, str):
+                    backends[name] = info
+
+            _LOADED_BACKENDS = backends
+            return backends
+        except ImportError:
+            # PyYAML not available, use defaults
+            pass
+        except Exception as e:
+            import sys
+            print(f"Warning: Failed to load backends config: {e}", file=sys.stderr)
+
+    _LOADED_BACKENDS = _DEFAULT_BACKENDS.copy()
+    return _LOADED_BACKENDS
 
 
 def get_backend(name: str) -> EmbeddingBackend:
@@ -194,15 +255,23 @@ def get_backend(name: str) -> EmbeddingBackend:
     Raises:
         ValueError: If backend not found
     """
-    if name not in BACKENDS:
-        available = ", ".join(BACKENDS.keys())
+    backends = _load_backends_config()
+
+    if name not in backends:
+        available = ", ".join(backends.keys())
         raise ValueError(f"Unknown backend: {name}. Available: {available}")
 
-    module_path = BACKENDS[name]
+    module_path = backends[name]
     module = importlib.import_module(module_path)
     return module.Backend()
 
 
 def list_backends() -> List[str]:
     """List available backend names."""
-    return list(BACKENDS.keys())
+    return list(_load_backends_config().keys())
+
+
+def reload_backends_config() -> None:
+    """Force reload of backends config (useful for testing)."""
+    global _LOADED_BACKENDS
+    _LOADED_BACKENDS = None
