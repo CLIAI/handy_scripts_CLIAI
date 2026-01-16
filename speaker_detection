@@ -1219,6 +1219,63 @@ def cmd_check_validity(args) -> int:
     return 1 if issues_found else 0
 
 
+def cmd_validate(args) -> int:
+    """Validate schema of profiles and embeddings."""
+    try:
+        from speaker_detection_backends.schemas import (
+            validate_profile,
+            validate_embedding,
+        )
+    except ImportError:
+        print("Error: Schema validation module not available.", file=sys.stderr)
+        return 1
+
+    # Get speakers to validate
+    if args.speaker_id:
+        speaker_id = normalize_speaker_id(args.speaker_id)
+        profile = load_speaker(speaker_id)
+        if not profile:
+            print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+            return 1
+        speakers = [profile]
+    else:
+        speakers = list_all_speakers()
+
+    if not speakers:
+        print("No speakers found.")
+        return 0
+
+    # Validate all profiles
+    total_warnings = 0
+    profiles_with_issues = 0
+
+    for profile in speakers:
+        speaker_id = profile["id"]
+        warnings = validate_profile(profile, strict=False)
+
+        if warnings:
+            profiles_with_issues += 1
+            total_warnings += len(warnings)
+
+            if args.verbose or not args.quiet:
+                print(f"\n{speaker_id}:")
+                for w in warnings:
+                    print(f"  - {w}")
+        elif args.verbose:
+            print(f"{speaker_id}: OK")
+
+    # Summary
+    if not args.quiet:
+        print(f"\nValidated {len(speakers)} profiles")
+        if total_warnings > 0:
+            print(f"  {profiles_with_issues} profiles with issues")
+            print(f"  {total_warnings} total warnings")
+        else:
+            print("  All profiles valid")
+
+    return 1 if total_warnings > 0 and args.strict else 0
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -1364,6 +1421,19 @@ def main():
     check_parser.add_argument("-v", "--verbose", action="store_true",
                               help="Show all embeddings, not just issues")
     check_parser.set_defaults(func=cmd_check_validity)
+
+    # validate command
+    validate_parser = subparsers.add_parser("validate",
+                                            help="Validate schema of profiles and embeddings")
+    validate_parser.add_argument("speaker_id", nargs="?",
+                                 help="Speaker ID (optional, validates all if omitted)")
+    validate_parser.add_argument("-v", "--verbose", action="store_true",
+                                 help="Show OK profiles too")
+    validate_parser.add_argument("-q", "--quiet", action="store_true",
+                                 help="Only show summary")
+    validate_parser.add_argument("--strict", action="store_true",
+                                 help="Return non-zero exit code on warnings")
+    validate_parser.set_defaults(func=cmd_validate)
 
     args = parser.parse_args()
     return args.func(args)
