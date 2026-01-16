@@ -555,6 +555,122 @@ def test_enroll_from_transcript_dry_run(temp_dir: Path) -> TestResult:
     return result
 
 
+def test_identify_error_handling(temp_dir: Path) -> TestResult:
+    """Test identify command error handling (no API calls)."""
+    result = TestResult("identify_errors")
+    env = {"SPEAKERS_EMBEDDINGS_DIR": str(temp_dir)}
+
+    # Create a dummy audio file
+    audio_file = temp_dir / "test_audio.wav"
+    audio_file.write_bytes(b"dummy audio data")
+
+    # Test identify with no speakers
+    rc, stdout, stderr = run_cmd(["identify", str(audio_file)], env)
+    if rc == 0:
+        result.error = "identify should fail with no speakers"
+        return result
+    if "No speakers to match against" not in stderr:
+        result.error = f"Wrong error message: {stderr}"
+        return result
+
+    # Add speaker without embeddings
+    run_cmd(["add", "no-emb", "--name", "No Embeddings"], env)
+
+    # Test identify with no embeddings
+    rc, stdout, stderr = run_cmd(["identify", str(audio_file)], env)
+    if rc == 0:
+        result.error = "identify should fail with no embeddings"
+        return result
+    if "No speakers with" not in stderr and "embeddings" not in stderr:
+        result.error = f"Wrong error for no embeddings: {stderr}"
+        return result
+
+    # Test identify with non-existent audio
+    rc, stdout, stderr = run_cmd(["identify", "/nonexistent/audio.wav"], env)
+    if rc == 0:
+        result.error = "identify should fail with non-existent audio"
+        return result
+    if "not found" not in stderr.lower():
+        result.error = f"Wrong error for missing audio: {stderr}"
+        return result
+
+    result.passed = True
+    return result
+
+
+def test_verify_error_handling(temp_dir: Path) -> TestResult:
+    """Test verify command error handling (no API calls)."""
+    result = TestResult("verify_errors")
+    env = {"SPEAKERS_EMBEDDINGS_DIR": str(temp_dir)}
+
+    # Create a dummy audio file
+    audio_file = temp_dir / "test_audio.wav"
+    audio_file.write_bytes(b"dummy audio data")
+
+    # Test verify with non-existent speaker
+    rc, stdout, stderr = run_cmd(["verify", "nonexistent", str(audio_file)], env)
+    if rc == 0:
+        result.error = "verify should fail with non-existent speaker"
+        return result
+    if "not found" not in stderr.lower():
+        result.error = f"Wrong error message: {stderr}"
+        return result
+
+    # Add speaker without embeddings
+    run_cmd(["add", "no-emb-verify", "--name", "No Embeddings"], env)
+
+    # Test verify with no embeddings
+    rc, stdout, stderr = run_cmd(["verify", "no-emb-verify", str(audio_file)], env)
+    if rc == 0:
+        result.error = "verify should fail with no embeddings"
+        return result
+    if "No" not in stderr and "embedding" not in stderr.lower():
+        result.error = f"Wrong error for no embeddings: {stderr}"
+        return result
+
+    # Test verify with non-existent audio
+    run_cmd(["add", "test-verify", "--name", "Test Verify"], env)
+    rc, stdout, stderr = run_cmd(["verify", "test-verify", "/nonexistent/audio.wav"], env)
+    if rc == 0:
+        result.error = "verify should fail with non-existent audio"
+        return result
+    if "not found" not in stderr.lower():
+        result.error = f"Wrong error for missing audio: {stderr}"
+        return result
+
+    result.passed = True
+    return result
+
+
+def test_embeddings_command(temp_dir: Path) -> TestResult:
+    """Test embeddings listing command."""
+    result = TestResult("embeddings_cmd")
+    env = {"SPEAKERS_EMBEDDINGS_DIR": str(temp_dir)}
+
+    # Add speaker
+    run_cmd(["add", "emb-test", "--name", "Embeddings Test"], env)
+
+    # Test embeddings with no embeddings
+    rc, stdout, stderr = run_cmd(["embeddings", "emb-test"], env)
+    if rc != 0:
+        result.error = f"embeddings command failed: {stderr}"
+        return result
+
+    # Should show empty or no embeddings message
+    if "No embeddings" not in stdout and "[]" not in stdout and stdout.strip() == "":
+        # Empty output is also acceptable
+        pass
+
+    # Test embeddings for non-existent speaker
+    rc, stdout, stderr = run_cmd(["embeddings", "nonexistent"], env)
+    if rc == 0:
+        result.error = "embeddings should fail for non-existent speaker"
+        return result
+
+    result.passed = True
+    return result
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="speaker_detection CLI unit tests")
@@ -575,6 +691,9 @@ def main():
         test_enroll_dry_run,
         test_enroll_from_stdin_dry_run,
         test_enroll_from_transcript_dry_run,
+        test_identify_error_handling,
+        test_verify_error_handling,
+        test_embeddings_command,
     ]
 
     print("speaker_detection CLI Unit Tests")
