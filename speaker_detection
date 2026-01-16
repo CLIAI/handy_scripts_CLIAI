@@ -50,12 +50,26 @@ try:
 except ImportError:
     YAML_AVAILABLE = False
 
+# Try to import migrations module
+try:
+    from speaker_detection_backends.migrations import (
+        migrate_profile,
+        migrate_sample_metadata,
+        PROFILE_SCHEMA_VERSION,
+        SAMPLE_METADATA_VERSION,
+    )
+    MIGRATIONS_AVAILABLE = True
+except ImportError:
+    MIGRATIONS_AVAILABLE = False
+    PROFILE_SCHEMA_VERSION = 1
+    SAMPLE_METADATA_VERSION = 2
+
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 
 DEFAULT_DB_DIR = os.path.expanduser("~/.config/speakers_embeddings")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = PROFILE_SCHEMA_VERSION if MIGRATIONS_AVAILABLE else 1
 
 
 def get_db_dir() -> Path:
@@ -143,13 +157,32 @@ def get_speaker_path(speaker_id: str) -> Path:
     return get_speakers_db_path() / f"{speaker_id}.json"
 
 
-def load_speaker(speaker_id: str) -> Optional[Dict[str, Any]]:
-    """Load a speaker profile from disk."""
+def load_speaker(speaker_id: str, auto_migrate: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Load a speaker profile from disk, with optional schema migration.
+
+    Args:
+        speaker_id: The speaker identifier
+        auto_migrate: If True, automatically migrate to current schema version
+
+    Returns:
+        Speaker profile dict, or None if not found
+    """
     path = get_speaker_path(speaker_id)
     if not path.exists():
         return None
     with open(path, "r") as f:
-        return json.load(f)
+        profile = json.load(f)
+
+    # Apply migrations if available and needed
+    if auto_migrate and MIGRATIONS_AVAILABLE:
+        current_version = profile.get("version", 0)
+        if current_version < PROFILE_SCHEMA_VERSION:
+            profile = migrate_profile(profile)
+            # Save migrated profile
+            save_speaker(profile)
+
+    return profile
 
 
 def save_speaker(profile: Dict[str, Any]) -> None:
@@ -236,21 +269,42 @@ def compute_b3sum(file_path: Path) -> str:
         return h.hexdigest()[:32]
 
 
-def load_sample_metadata(meta_path: Path) -> Optional[Dict[str, Any]]:
-    """Load sample metadata from YAML file."""
+def load_sample_metadata(meta_path: Path, auto_migrate: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Load sample metadata from YAML file, with optional schema migration.
+
+    Args:
+        meta_path: Path to the metadata YAML file
+        auto_migrate: If True, migrate to current schema version and save
+
+    Returns:
+        Metadata dict, or None if not found
+    """
     if not meta_path.exists():
         return None
 
     if YAML_AVAILABLE:
         with open(meta_path, "r") as f:
-            return yaml.safe_load(f)
+            meta = yaml.safe_load(f)
     else:
         # Fallback: try JSON if stored as JSON
         try:
             with open(meta_path, "r") as f:
-                return json.load(f)
+                meta = json.load(f)
         except json.JSONDecodeError:
             return None
+
+    # Apply migrations if available and needed
+    if meta and auto_migrate and MIGRATIONS_AVAILABLE:
+        current_version = meta.get("version", 0)
+        if current_version < SAMPLE_METADATA_VERSION:
+            meta = migrate_sample_metadata(meta)
+            # Save migrated metadata (requires yaml)
+            if YAML_AVAILABLE:
+                with open(meta_path, "w") as f:
+                    yaml.safe_dump(meta, f, default_flow_style=False, allow_unicode=True)
+
+    return meta
 
 
 def get_speaker_samples(speaker_id: str) -> List[Dict[str, Any]]:
