@@ -34,13 +34,21 @@ Environment:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -68,6 +76,11 @@ def get_embeddings_path() -> Path:
 def get_config_path() -> Path:
     """Get the config file path."""
     return get_db_dir() / "config.json"
+
+
+def get_samples_path() -> Path:
+    """Get the samples storage directory (shared with speaker_samples)."""
+    return get_db_dir() / "samples"
 
 
 def ensure_dirs():
@@ -198,6 +211,119 @@ def filter_speakers_by_tags(
                 result.append(speaker)
 
     return result
+
+
+# ----------------------------------------------------------------------
+# Sample Tracking (for trust levels)
+# ----------------------------------------------------------------------
+
+def compute_b3sum(file_path: Path) -> str:
+    """Compute blake3 hash using b3sum CLI, fallback to sha256 if unavailable."""
+    try:
+        result = subprocess.run(
+            ["b3sum", "--no-names", str(file_path)],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return result.stdout.strip()[:32]  # First 32 chars (128 bits)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fall back to sha256
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()[:32]
+
+
+def load_sample_metadata(meta_path: Path) -> Optional[Dict[str, Any]]:
+    """Load sample metadata from YAML file."""
+    if not meta_path.exists():
+        return None
+
+    if YAML_AVAILABLE:
+        with open(meta_path, "r") as f:
+            return yaml.safe_load(f)
+    else:
+        # Fallback: try JSON if stored as JSON
+        try:
+            with open(meta_path, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return None
+
+
+def get_speaker_samples(speaker_id: str) -> List[Dict[str, Any]]:
+    """Get all sample metadata for a speaker."""
+    samples_dir = get_samples_path() / speaker_id
+    if not samples_dir.exists():
+        return []
+
+    samples = []
+    for meta_path in sorted(samples_dir.glob("*.meta.yaml")):
+        meta = load_sample_metadata(meta_path)
+        if meta:
+            samples.append(meta)
+
+    return samples
+
+
+def get_samples_by_source_audio(speaker_id: str, audio_b3sum: str) -> Dict[str, List[str]]:
+    """
+    Get sample b3sums categorized by review status for samples from a specific source audio.
+
+    Returns dict with keys: 'reviewed', 'unreviewed', 'rejected'
+    """
+    samples = get_speaker_samples(speaker_id)
+
+    result = {"reviewed": [], "unreviewed": [], "rejected": []}
+
+    for sample in samples:
+        source = sample.get("source", {})
+        # Match by source audio b3sum
+        if source.get("audio_b3sum") != audio_b3sum:
+            continue
+
+        sample_b3sum = sample.get("b3sum")
+        if not sample_b3sum:
+            continue
+
+        # Check review status
+        review = sample.get("review", {})
+        status = review.get("status", "pending")
+
+        if status == "reviewed":
+            result["reviewed"].append(sample_b3sum)
+        elif status == "rejected":
+            result["rejected"].append(sample_b3sum)
+        else:  # pending or unknown
+            result["unreviewed"].append(sample_b3sum)
+
+    return result
+
+
+def compute_trust_level(samples: Dict[str, List[str]]) -> str:
+    """
+    Compute trust level from sample hash lists.
+
+    - HIGH: All samples reviewed, none rejected
+    - MEDIUM: Mix of reviewed + unreviewed, none rejected
+    - LOW: All samples unreviewed
+    - INVALIDATED: Any sample rejected
+    """
+    reviewed = samples.get("reviewed", [])
+    unreviewed = samples.get("unreviewed", [])
+    rejected = samples.get("rejected", [])
+
+    if rejected:
+        return "invalidated"
+    if not unreviewed and reviewed:
+        return "high"
+    if reviewed:
+        return "medium"
+    if unreviewed:
+        return "low"
+    return "unknown"  # No samples at all
 
 
 # ----------------------------------------------------------------------
@@ -639,13 +765,25 @@ def cmd_enroll(args) -> int:
     # Generate embedding ID
     emb_id = f"emb-{uuid.uuid4().hex[:8]}"
 
+    # Compute source audio b3sum for sample tracking
+    audio_b3sum = compute_b3sum(audio_path)
+
+    # Get sample hashes from speaker_samples storage (if any)
+    samples_by_status = get_samples_by_source_audio(speaker_id, audio_b3sum)
+
+    # Compute trust level
+    trust_level = compute_trust_level(samples_by_status)
+
     # Build embedding record
     embedding_record = {
         "id": emb_id,
         "external_id": result.get("external_id"),
         "source_audio": str(audio_path.resolve()),
+        "source_audio_b3sum": audio_b3sum,
         "source_segments": [{"start": s, "end": e} for s, e in segments] if segments else None,
         "model_version": result.get("model_version", "unknown"),
+        "samples": samples_by_status,
+        "trust_level": trust_level,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -660,7 +798,12 @@ def cmd_enroll(args) -> int:
     profile["embeddings"][backend_name].append(embedding_record)
     save_speaker(profile)
 
-    print(f"Enrolled embedding {emb_id} for speaker '{speaker_id}'")
+    # Show enrollment result
+    total_samples = len(samples_by_status["reviewed"]) + len(samples_by_status["unreviewed"])
+    if total_samples > 0:
+        print(f"Enrolled embedding {emb_id} for speaker '{speaker_id}' (trust: {trust_level}, {total_samples} samples tracked)")
+    else:
+        print(f"Enrolled embedding {emb_id} for speaker '{speaker_id}' (no samples tracked)")
     return 0
 
 
@@ -694,7 +837,18 @@ def cmd_embeddings(args) -> int:
             source = emb.get("source_audio", "unknown")
             if len(source) > 50:
                 source = "..." + source[-47:]
-            print(f"  {emb['id']}  {created}  {source}")
+
+            line = f"  {emb['id']}  {created}  {source}"
+
+            if args.show_trust:
+                trust = emb.get("trust_level", "unknown")
+                samples = emb.get("samples", {})
+                reviewed = len(samples.get("reviewed", []))
+                unreviewed = len(samples.get("unreviewed", []))
+                rejected = len(samples.get("rejected", []))
+                line += f"  [{trust}] ({reviewed}r/{unreviewed}u/{rejected}x)"
+
+            print(line)
 
     return 0
 
@@ -835,6 +989,132 @@ def cmd_verify(args) -> int:
         return 1
 
 
+def check_embedding_validity(speaker_id: str, emb: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Check if an embedding's trust level needs updating based on current sample states.
+
+    Returns dict with:
+      - id: embedding ID
+      - old_trust: stored trust level
+      - new_trust: computed trust level from current sample states
+      - changed: whether trust level changed
+      - newly_rejected: list of sample b3sums that were reviewed/unreviewed but are now rejected
+    """
+    emb_id = emb.get("id", "unknown")
+    old_trust = emb.get("trust_level", "unknown")
+    stored_samples = emb.get("samples", {})
+
+    # Get all sample hashes from the embedding
+    all_hashes = set(
+        stored_samples.get("reviewed", []) +
+        stored_samples.get("unreviewed", []) +
+        stored_samples.get("rejected", [])
+    )
+
+    if not all_hashes:
+        # No samples tracked, can't recompute
+        return {
+            "id": emb_id,
+            "old_trust": old_trust,
+            "new_trust": "unknown",
+            "changed": False,
+            "newly_rejected": [],
+        }
+
+    # Load current sample states
+    samples = get_speaker_samples(speaker_id)
+    current_states = {}  # b3sum -> status
+
+    for sample in samples:
+        b3sum = sample.get("b3sum")
+        if b3sum:
+            status = sample.get("review", {}).get("status", "pending")
+            current_states[b3sum] = status
+
+    # Recompute sample lists based on current states
+    new_samples = {"reviewed": [], "unreviewed": [], "rejected": []}
+    newly_rejected = []
+
+    for h in all_hashes:
+        current_status = current_states.get(h, "pending")
+        if current_status == "reviewed":
+            new_samples["reviewed"].append(h)
+        elif current_status == "rejected":
+            new_samples["rejected"].append(h)
+            # Check if it was previously not rejected
+            if h not in stored_samples.get("rejected", []):
+                newly_rejected.append(h)
+        else:
+            new_samples["unreviewed"].append(h)
+
+    new_trust = compute_trust_level(new_samples)
+
+    return {
+        "id": emb_id,
+        "old_trust": old_trust,
+        "new_trust": new_trust,
+        "changed": old_trust != new_trust,
+        "newly_rejected": newly_rejected,
+    }
+
+
+def cmd_check_validity(args) -> int:
+    """Check validity of embeddings based on current sample review states."""
+    # Get speakers to check
+    if args.speaker_id:
+        speaker_id = normalize_speaker_id(args.speaker_id)
+        profile = load_speaker(speaker_id)
+        if not profile:
+            print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
+            return 1
+        speakers = [profile]
+    else:
+        speakers = list_all_speakers()
+
+    if not speakers:
+        print("No speakers found.")
+        return 0
+
+    # Check all embeddings
+    issues_found = False
+    total_checked = 0
+    total_invalidated = 0
+    total_changed = 0
+
+    for profile in speakers:
+        speaker_id = profile["id"]
+        embeddings = profile.get("embeddings", {})
+
+        for backend, embs in embeddings.items():
+            for emb in embs:
+                total_checked += 1
+                result = check_embedding_validity(speaker_id, emb)
+
+                if result["changed"]:
+                    total_changed += 1
+
+                if result["new_trust"] == "invalidated":
+                    total_invalidated += 1
+                    issues_found = True
+                    print(f"INVALIDATED: {speaker_id}/{backend}/{result['id']}")
+                    if result["newly_rejected"]:
+                        print(f"  Newly rejected samples: {', '.join(result['newly_rejected'][:3])}")
+                elif result["changed"]:
+                    if args.verbose:
+                        print(f"CHANGED: {speaker_id}/{backend}/{result['id']} ({result['old_trust']} -> {result['new_trust']})")
+                elif args.verbose:
+                    print(f"OK: {speaker_id}/{backend}/{result['id']} (trust: {result['old_trust']})")
+
+    # Summary
+    print(f"\nChecked {total_checked} embeddings across {len(speakers)} speakers")
+    if total_invalidated > 0:
+        print(f"  {total_invalidated} INVALIDATED (re-enrollment needed)")
+    if total_changed > 0:
+        print(f"  {total_changed} trust levels changed")
+
+    return 1 if issues_found else 0
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -935,6 +1215,8 @@ def main():
     emb_parser = subparsers.add_parser("embeddings", help="List speaker embeddings")
     emb_parser.add_argument("id", help="Speaker ID")
     emb_parser.add_argument("--backend", "-b", help="Filter by backend")
+    emb_parser.add_argument("--show-trust", action="store_true",
+                            help="Show trust level and sample counts")
     emb_parser.set_defaults(func=cmd_embeddings)
 
     # remove-embedding command
@@ -960,6 +1242,14 @@ def main():
     verify_parser.add_argument("--threshold", type=float, default=0.354,
                                help="Similarity threshold (default: 0.354)")
     verify_parser.set_defaults(func=cmd_verify)
+
+    # check-validity command
+    check_parser = subparsers.add_parser("check-validity",
+                                         help="Check embedding validity based on sample review states")
+    check_parser.add_argument("speaker_id", nargs="?", help="Speaker ID (optional, checks all if omitted)")
+    check_parser.add_argument("-v", "--verbose", action="store_true",
+                              help="Show all embeddings, not just issues")
+    check_parser.set_defaults(func=cmd_check_validity)
 
     args = parser.parse_args()
     return args.func(args)
