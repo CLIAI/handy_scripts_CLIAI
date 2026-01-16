@@ -809,6 +809,28 @@ def cmd_enroll(args) -> int:
         except Exception as e:
             print(f"Error extracting segments: {e}", file=sys.stderr)
             return 1
+    elif getattr(args, "from_stdin", False):
+        # Read JSONL segments from stdin (output from speaker_samples segments)
+        import sys as _sys
+        segments = []
+        try:
+            for line in _sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                start = record.get("start")
+                end = record.get("end")
+                if start is not None and end is not None:
+                    segments.append((float(start), float(end)))
+            if not segments:
+                print("Error: No segments read from stdin. Provide JSONL with 'start' and 'end' fields.", file=sys.stderr)
+                return 1
+            total_duration = sum(end - start for start, end in segments)
+            print(f"Read {len(segments)} segments from stdin ({total_duration:.1f}s total)", file=sys.stderr)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSONL from stdin: {e}", file=sys.stderr)
+            return 1
 
     # Dry-run mode: show what would be enrolled
     if getattr(args, "dry_run", False):
@@ -1297,6 +1319,8 @@ def main():
                                help="Extract segments from transcript JSON")
     enroll_parser.add_argument("--speaker-label", "-l",
                                help="Speaker label in transcript (e.g., 'A', 'S1')")
+    enroll_parser.add_argument("--from-stdin", action="store_true",
+                               help="Read segments from stdin (JSONL format from speaker_samples segments)")
     enroll_parser.add_argument("-n", "--dry-run", action="store_true",
                                help="Show what would be enrolled without making API calls")
     enroll_parser.set_defaults(func=cmd_enroll)
