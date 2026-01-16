@@ -7,7 +7,7 @@ provider-specific APIs or local models.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Union
 import importlib
 import os
 
@@ -16,6 +16,7 @@ from speaker_detection_backends.transcript import (
     extract_segments_as_tuples,
     load_transcript,
 )
+from speaker_detection_backends.audio_profiles import AudioProfile, get_profile
 
 
 class EmbeddingBackend(ABC):
@@ -42,6 +43,32 @@ class EmbeddingBackend(ABC):
     def model_version(self) -> str:
         """Model version string stored in embeddings."""
         return f"{self.name}-unknown"
+
+    @property
+    def audio_profile(self) -> Union[str, AudioProfile]:
+        """
+        Audio profile for this backend.
+
+        Returns either a profile name (str) to look up in PROFILES,
+        or an AudioProfile instance directly.
+
+        Default implementation returns "default".
+        Subclasses can override to return their specific profile name
+        or a custom AudioProfile instance.
+        """
+        return "default"
+
+    def get_audio_profile(self) -> AudioProfile:
+        """
+        Get the resolved AudioProfile for this backend.
+
+        Returns:
+            AudioProfile instance (resolves string profile names)
+        """
+        profile = self.audio_profile
+        if isinstance(profile, str):
+            return get_profile(profile)
+        return profile
 
     def check_embedding_compatibility(
         self,

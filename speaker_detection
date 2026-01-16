@@ -479,6 +479,12 @@ def cmd_list(args) -> int:
     if tags:
         speakers = filter_speakers_by_tags(speakers, tags, any_tag=False)
 
+    # Apply pagination (offset and limit)
+    if args.offset:
+        speakers = speakers[args.offset:]
+    if args.limit:
+        speakers = speakers[:args.limit]
+
     context = args.context or "default"
 
     if args.format == "json":
@@ -1311,6 +1317,8 @@ def main():
     list_parser.add_argument("--format", choices=["table", "json", "ids"], default="table",
                             help="Output format (default: table)")
     list_parser.add_argument("--context", help="Name context for display")
+    list_parser.add_argument("--limit", type=int, help="Maximum number of results to display")
+    list_parser.add_argument("--offset", type=int, default=0, help="Skip first N results (for pagination)")
     list_parser.set_defaults(func=cmd_list)
 
     # show command

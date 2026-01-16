@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+Extract speaker segment timestamps from transcript JSON files.
+
+Supports AssemblyAI and Speechmatics transcript formats.
+
+Usage:
+    speaker_segments <transcript_file> <speaker_label>
+    speaker_segments transcript.json Alice
+    speaker_segments transcript.json S1 --format tuples
+    speaker_segments transcript.json Bob --merge-gap 2.0 --format csv
+
+Output formats:
+    json (default): [{"start": 10.5, "end": 25.3}, ...]
+    tuples: [(10.5, 25.3), ...]
+    csv: start,end\\n10.5,25.3\\n...
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import List, Tuple
+
+# Add parent directory to path for imports
+script_dir = Path(__file__).parent.resolve()
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
+
+from speaker_detection_backends.transcript import (
+    load_transcript,
+    extract_segments_as_tuples,
+    get_available_speakers,
+    detect_transcript_format,
+)
+
+
+def merge_segments_by_gap(
+    segments: List[Tuple[float, float]],
+    max_gap: float,
+) -> List[Tuple[float, float]]:
+    """
+    Merge consecutive segments with gaps smaller than max_gap.
+
+    Args:
+        segments: List of (start, end) tuples
+        max_gap: Maximum gap in seconds to merge
+
+    Returns:
+        Merged list of (start, end) tuples
+    """
+    if not segments or max_gap <= 0:
+        return segments
+
+    merged = []
+    current_start, current_end = segments[0]
+
+    for start, end in segments[1:]:
+        gap = start - current_end
+        if gap <= max_gap:
+            # Merge with current segment
+            current_end = end
+        else:
+            # Save current and start new
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+
+    # Don't forget the last segment
+    merged.append((current_start, current_end))
+
+    return merged
+
+
+def format_json(segments: List[Tuple[float, float]]) -> str:
+    """Format segments as JSON array of objects."""
+    output = [{"start": s, "end": e} for s, e in segments]
+    return json.dumps(output, indent=2)
+
+
+def format_tuples(segments: List[Tuple[float, float]]) -> str:
+    """Format segments as Python tuples."""
+    return repr(segments)
+
+
+def format_csv(segments: List[Tuple[float, float]]) -> str:
+    """Format segments as CSV."""
+    lines = ["start,end"]
+    for start, end in segments:
+        lines.append(f"{start},{end}")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract speaker segment timestamps from transcript JSON files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Output formats:
+  json (default)  [{"start": 10.5, "end": 25.3}, ...]
+  tuples          [(10.5, 25.3), ...]
+  csv             start,end
+                  10.5,25.3
+                  ...
+
+Examples:
+  speaker_segments transcript.json Alice
+  speaker_segments transcript.json S1 --format tuples
+  speaker_segments transcript.json Bob --merge-gap 2.0 --format csv
+""",
+    )
+    parser.add_argument(
+        "transcript_file",
+        type=Path,
+        help="Path to transcript JSON file (AssemblyAI or Speechmatics format)",
+    )
+    parser.add_argument(
+        "speaker_label",
+        help="Speaker label to extract segments for (e.g., 'S1', 'Alice', 'A')",
+    )
+    parser.add_argument(
+        "-f", "--format",
+        choices=["json", "tuples", "csv"],
+        default="json",
+        help="Output format (default: json)",
+    )
+    parser.add_argument(
+        "--merge-gap",
+        type=float,
+        default=0,
+        metavar="N",
+        help="Merge segments with gaps smaller than N seconds (default: 0, no merging)",
+    )
+    parser.add_argument(
+        "--list-speakers",
+        action="store_true",
+        help="List available speakers in the transcript and exit",
+    )
+
+    args = parser.parse_args()
+
+    # Validate transcript file exists
+    if not args.transcript_file.exists():
+        print(f"Error: Transcript file not found: {args.transcript_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load transcript
+    try:
+        data = load_transcript(args.transcript_file)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in transcript file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Detect format
+    fmt = detect_transcript_format(data)
+    if fmt == "unknown":
+        print(
+            "Warning: Unknown transcript format. Supported: AssemblyAI, Speechmatics",
+            file=sys.stderr,
+        )
+
+    # List speakers mode
+    if args.list_speakers:
+        speakers = get_available_speakers(data)
+        if speakers:
+            print("Available speakers:")
+            for speaker in speakers:
+                print(f"  {speaker}")
+        else:
+            print("No speakers found in transcript", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    # Get available speakers for validation
+    available_speakers = get_available_speakers(data)
+    if args.speaker_label not in available_speakers:
+        print(
+            f"Error: Speaker '{args.speaker_label}' not found in transcript.",
+            file=sys.stderr,
+        )
+        if available_speakers:
+            print(f"Available speakers: {', '.join(available_speakers)}", file=sys.stderr)
+        else:
+            print("No speakers found in transcript.", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract segments
+    segments = extract_segments_as_tuples(data, args.speaker_label)
+
+    if not segments:
+        print(
+            f"Warning: No segments found for speaker '{args.speaker_label}'",
+            file=sys.stderr,
+        )
+
+    # Merge if requested
+    if args.merge_gap > 0:
+        segments = merge_segments_by_gap(segments, args.merge_gap)
+
+    # Format output
+    if args.format == "json":
+        output = format_json(segments)
+    elif args.format == "tuples":
+        output = format_tuples(segments)
+    elif args.format == "csv":
+        output = format_csv(segments)
+    else:
+        output = format_json(segments)
+
+    print(output)
+
+
+if __name__ == "__main__":
+    main()

@@ -276,11 +276,13 @@ SPEAKER_DETECTION_DEBUG  # Debug flags
 
 ### Standard Variables
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `SPEAKERS_EMBEDDINGS_DIR` | All speaker data | `~/.config/speakers_embeddings` |
-| `SPEAKER_DETECTION_BACKEND` | Default backend | `speechmatics` |
-| `SPEECHMATICS_API_KEY` | API access | (none) |
+| Variable | Description | Default | Used By |
+|----------|-------------|---------|---------|
+| `SPEAKERS_EMBEDDINGS_DIR` | Base directory for speaker data (profiles, embeddings, samples) | `~/.config/speakers_embeddings` | `speaker_detection`, `speaker_samples` |
+| `SPEAKER_DETECTION_BACKEND` | Default embedding backend when `--backend` not specified | `speechmatics` | `speaker_detection` |
+| `SPEAKER_BACKENDS_CONFIG` | Path to YAML config file defining available backends | `speaker_detection_backends/backends.yaml` | `speaker_detection_backends/base.py` |
+| `SPEECHMATICS_API_KEY` | API key for Speechmatics speech-to-text and speaker ID services | (required) | `speaker_detection_backends/speechmatics_backend.py` |
+| `SPEAKER_DETECTION_DEBUG` | Enable debug logging for speaker identification (any non-empty value) | (disabled) | `speaker_detection_backends/speechmatics_backend.py` |
 
 ## Error Handling
 

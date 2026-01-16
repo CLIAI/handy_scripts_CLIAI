@@ -71,7 +71,11 @@ def test_add_speaker(temp_dir: Path) -> TestResult:
 
     # Verify JSON structure
     with open(profile_path) as f:
-        profile = json.load(f)
+        try:
+            profile = json.load(f)
+        except json.JSONDecodeError as e:
+            result.error = f"Failed to parse profile JSON: {e}\nFile: {profile_path}"
+            return result
 
     checks = [
         (profile.get("id") == "test-user", "id mismatch"),
@@ -116,7 +120,11 @@ def test_list_speakers(temp_dir: Path) -> TestResult:
         result.error = f"list --format json failed: {stderr}"
         return result
 
-    speakers = json.loads(stdout)
+    try:
+        speakers = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
     if len(speakers) != 3:
         result.error = f"Expected 3 speakers, got {len(speakers)}"
         return result
@@ -150,7 +158,11 @@ def test_show_speaker(temp_dir: Path) -> TestResult:
         result.error = f"show failed: {stderr}"
         return result
 
-    profile = json.loads(stdout)
+    try:
+        profile = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse show JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
     if profile.get("id") != "test-show":
         result.error = f"Wrong profile returned: {profile.get('id')}"
         return result
@@ -187,7 +199,11 @@ def test_update_speaker(temp_dir: Path) -> TestResult:
 
     # Verify changes
     rc, stdout, stderr = run_cmd(["show", "update-test"], env)
-    profile = json.loads(stdout)
+    try:
+        profile = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse show JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
 
     if profile.get("names", {}).get("default") != "New Name":
         result.error = "Name not updated"
@@ -251,7 +267,11 @@ def test_tag_command(temp_dir: Path) -> TestResult:
 
     # Verify tag added
     rc, stdout, stderr = run_cmd(["show", "tag-test"], env)
-    profile = json.loads(stdout)
+    try:
+        profile = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse show JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
     if "added-tag" not in profile.get("tags", []):
         result.error = "Tag not added"
         return result
@@ -264,7 +284,11 @@ def test_tag_command(temp_dir: Path) -> TestResult:
 
     # Verify tag removed
     rc, stdout, stderr = run_cmd(["show", "tag-test"], env)
-    profile = json.loads(stdout)
+    try:
+        profile = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse show JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
     if "added-tag" in profile.get("tags", []):
         result.error = "Tag not removed"
         return result
@@ -289,7 +313,11 @@ def test_export(temp_dir: Path) -> TestResult:
         result.error = f"export failed: {stderr}"
         return result
 
-    data = json.loads(stdout)
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse export JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
     if len(data.get("speakers", [])) != 3:
         result.error = f"Expected 3 speakers in export, got {len(data.get('speakers', []))}"
         return result
@@ -300,7 +328,11 @@ def test_export(temp_dir: Path) -> TestResult:
         result.error = f"export --tags failed: {stderr}"
         return result
 
-    data = json.loads(stdout)
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse export JSON output with tag filter: {e}\nOutput was: {stdout[:200]}"
+        return result
     if len(data.get("speakers", [])) != 2:
         result.error = f"Expected 2 speakers with tag filter, got {len(data.get('speakers', []))}"
         return result
@@ -360,7 +392,11 @@ def test_name_context(temp_dir: Path) -> TestResult:
 
     # Verify contexts
     rc, stdout, stderr = run_cmd(["show", "context-test"], env)
-    profile = json.loads(stdout)
+    try:
+        profile = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        result.error = f"Failed to parse show JSON output: {e}\nOutput was: {stdout[:200]}"
+        return result
     names = profile.get("names", {})
 
     if names.get("default") != "Default Name":

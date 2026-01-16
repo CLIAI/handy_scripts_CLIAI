@@ -40,6 +40,23 @@ class TestResult:
         self.skipped = False
 
 
+def get_first_sample_id(temp_dir: Path, speaker_id: str) -> str | None:
+    """Get the first sample ID for a speaker (without assuming specific numbering).
+
+    Returns the sample ID (stem without extension) or None if no samples found.
+    """
+    samples_dir = temp_dir / "samples" / speaker_id
+    if not samples_dir.exists():
+        return None
+
+    # Look for .mp3 files (the actual samples, not metadata)
+    samples = sorted(samples_dir.glob("*.mp3"))
+    if not samples:
+        return None
+
+    return samples[0].stem
+
+
 def run_cmd(cmd_path: Path, args: list, env: dict = None) -> tuple:
     """Run command, return (returncode, stdout, stderr)."""
     cmd = [str(cmd_path)] + args
@@ -137,7 +154,11 @@ def test_samples_extract_with_b3sum(temp_dir: Path) -> TestResult:
     # Read metadata
     import yaml
     with open(meta_files[0]) as f:
-        meta = yaml.safe_load(f)
+        try:
+            meta = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            result.error = f"Failed to parse metadata YAML: {e}\nFile: {meta_files[0]}"
+            return result
 
     if meta.get("version") != 2:
         result.error = f"Wrong metadata version: {meta.get('version')}"
@@ -182,9 +203,15 @@ def test_samples_review_approve(temp_dir: Path) -> TestResult:
         result.error = f"extract failed: {stderr}"
         return result
 
+    # Get the actual sample ID dynamically
+    sample_id = get_first_sample_id(temp_dir, "review-test")
+    if not sample_id:
+        result.error = "No samples extracted"
+        return result
+
     # Approve the sample
     rc, stdout, stderr = run_cmd(SPEAKER_SAMPLES, [
-        "review", "review-test", "sample-001",
+        "review", "review-test", sample_id,
         "--approve",
         "--notes", "Test approval note",
     ], env)
@@ -199,9 +226,13 @@ def test_samples_review_approve(temp_dir: Path) -> TestResult:
 
     # Verify metadata updated
     import yaml
-    meta_path = temp_dir / "samples" / "review-test" / "sample-001.meta.yaml"
+    meta_path = temp_dir / "samples" / "review-test" / f"{sample_id}.meta.yaml"
     with open(meta_path) as f:
-        meta = yaml.safe_load(f)
+        try:
+            meta = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            result.error = f"Failed to parse metadata YAML: {e}\nFile: {meta_path}"
+            return result
 
     review = meta.get("review", {})
     if review.get("status") != "reviewed":
@@ -237,9 +268,15 @@ def test_samples_review_reject(temp_dir: Path) -> TestResult:
         result.error = f"extract failed: {stderr}"
         return result
 
+    # Get the actual sample ID dynamically
+    sample_id = get_first_sample_id(temp_dir, "reject-test")
+    if not sample_id:
+        result.error = "No samples extracted"
+        return result
+
     # Reject the sample
     rc, stdout, stderr = run_cmd(SPEAKER_SAMPLES, [
-        "review", "reject-test", "sample-001",
+        "review", "reject-test", sample_id,
         "--reject",
         "--notes", "Wrong speaker",
     ], env)
@@ -254,9 +291,13 @@ def test_samples_review_reject(temp_dir: Path) -> TestResult:
 
     # Verify metadata
     import yaml
-    meta_path = temp_dir / "samples" / "reject-test" / "sample-001.meta.yaml"
+    meta_path = temp_dir / "samples" / "reject-test" / f"{sample_id}.meta.yaml"
     with open(meta_path) as f:
-        meta = yaml.safe_load(f)
+        try:
+            meta = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            result.error = f"Failed to parse metadata YAML: {e}\nFile: {meta_path}"
+            return result
 
     if meta.get("review", {}).get("status") != "rejected":
         result.error = "Status not updated to rejected"
@@ -288,8 +329,14 @@ def test_samples_list_with_review(temp_dir: Path) -> TestResult:
         "-s", "list-test",
     ], env)
 
+    # Get the actual sample ID dynamically (first sample)
+    sample_id = get_first_sample_id(temp_dir, "list-test")
+    if not sample_id:
+        result.error = "No samples extracted"
+        return result
+
     # Approve first sample
-    run_cmd(SPEAKER_SAMPLES, ["review", "list-test", "sample-001", "--approve"], env)
+    run_cmd(SPEAKER_SAMPLES, ["review", "list-test", sample_id, "--approve"], env)
 
     # Test list --show-review
     rc, stdout, stderr = run_cmd(SPEAKER_SAMPLES, ["list", "list-test", "--show-review"], env)
@@ -309,9 +356,9 @@ def test_samples_list_with_review(temp_dir: Path) -> TestResult:
         result.error = f"list --status reviewed failed: {stderr}"
         return result
 
-    # Should only show reviewed samples
-    if "sample-001" not in stdout:
-        result.error = f"sample-001 should be in reviewed list: {stdout}"
+    # Should only show reviewed samples - check the actual sample_id we approved
+    if sample_id not in stdout:
+        result.error = f"{sample_id} should be in reviewed list: {stdout}"
         return result
 
     result.passed = True
@@ -483,18 +530,32 @@ def test_check_validity_with_mock_embedding(temp_dir: Path) -> TestResult:
         "-s", "mock-speaker",
     ], env)
 
+    # Get the actual sample ID dynamically
+    sample_id = get_first_sample_id(temp_dir, "mock-speaker")
+    if not sample_id:
+        result.error = "No samples extracted"
+        return result
+
     # Get the sample b3sum
     import yaml
-    meta_path = temp_dir / "samples" / "mock-speaker" / "sample-001.meta.yaml"
+    meta_path = temp_dir / "samples" / "mock-speaker" / f"{sample_id}.meta.yaml"
     with open(meta_path) as f:
-        meta = yaml.safe_load(f)
+        try:
+            meta = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            result.error = f"Failed to parse metadata YAML: {e}\nFile: {meta_path}"
+            return result
     sample_b3sum = meta["b3sum"]
     audio_b3sum = meta["source"]["audio_b3sum"]
 
     # Manually create an embedding record in the speaker profile
     profile_path = temp_dir / "db" / "mock-speaker.json"
     with open(profile_path) as f:
-        profile = json.load(f)
+        try:
+            profile = json.load(f)
+        except json.JSONDecodeError as e:
+            result.error = f"Failed to parse profile JSON: {e}\nFile: {profile_path}"
+            return result
 
     # Add mock embedding with sample tracking
     profile["embeddings"] = {
@@ -528,7 +589,7 @@ def test_check_validity_with_mock_embedding(temp_dir: Path) -> TestResult:
         return result
 
     # Now approve the sample
-    run_cmd(SPEAKER_SAMPLES, ["review", "mock-speaker", "sample-001", "--approve"], env)
+    run_cmd(SPEAKER_SAMPLES, ["review", "mock-speaker", sample_id, "--approve"], env)
 
     # Run check-validity again - trust should change from low to high
     rc, stdout, stderr = run_cmd(SPEAKER_DETECTION, ["check-validity", "-v"], env)
@@ -555,18 +616,32 @@ def test_check_validity_detects_invalidation(temp_dir: Path) -> TestResult:
         "-s", "invalid-test",
     ], env)
 
+    # Get the actual sample ID dynamically
+    sample_id = get_first_sample_id(temp_dir, "invalid-test")
+    if not sample_id:
+        result.error = "No samples extracted"
+        return result
+
     # Get sample info
     import yaml
-    meta_path = temp_dir / "samples" / "invalid-test" / "sample-001.meta.yaml"
+    meta_path = temp_dir / "samples" / "invalid-test" / f"{sample_id}.meta.yaml"
     with open(meta_path) as f:
-        meta = yaml.safe_load(f)
+        try:
+            meta = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            result.error = f"Failed to parse metadata YAML: {e}\nFile: {meta_path}"
+            return result
     sample_b3sum = meta["b3sum"]
     audio_b3sum = meta["source"]["audio_b3sum"]
 
     # Create embedding with sample marked as unreviewed
     profile_path = temp_dir / "db" / "invalid-test.json"
     with open(profile_path) as f:
-        profile = json.load(f)
+        try:
+            profile = json.load(f)
+        except json.JSONDecodeError as e:
+            result.error = f"Failed to parse profile JSON: {e}\nFile: {profile_path}"
+            return result
 
     profile["embeddings"] = {
         "mock-backend": [{
@@ -592,7 +667,7 @@ def test_check_validity_detects_invalidation(temp_dir: Path) -> TestResult:
         return result
 
     # Now REJECT the sample
-    run_cmd(SPEAKER_SAMPLES, ["review", "invalid-test", "sample-001", "--reject"], env)
+    run_cmd(SPEAKER_SAMPLES, ["review", "invalid-test", sample_id, "--reject"], env)
 
     # Check-validity should now detect INVALIDATED
     rc, stdout, stderr = run_cmd(SPEAKER_DETECTION, ["check-validity"], env)
@@ -620,7 +695,11 @@ def test_embeddings_show_trust(temp_dir: Path) -> TestResult:
 
     profile_path = temp_dir / "db" / "trust-test.json"
     with open(profile_path) as f:
-        profile = json.load(f)
+        try:
+            profile = json.load(f)
+        except json.JSONDecodeError as e:
+            result.error = f"Failed to parse profile JSON: {e}\nFile: {profile_path}"
+            return result
 
     profile["embeddings"] = {
         "test-backend": [{

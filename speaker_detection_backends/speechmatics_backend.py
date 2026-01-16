@@ -91,6 +91,11 @@ class SpeechmaticsBackend(EmbeddingBackend):
         return True
 
     @property
+    def audio_profile(self) -> str:
+        """Return the speechmatics audio profile name."""
+        return "speechmatics"
+
+    @property
     def api_version(self) -> str:
         """Current API version string."""
         return API_VERSION

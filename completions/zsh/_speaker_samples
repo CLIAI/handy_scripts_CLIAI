@@ -1,0 +1,106 @@
+#compdef speaker_samples
+
+# Zsh completion for speaker_samples CLI
+# Place in a directory in your $fpath (e.g., ~/.zsh/completions/)
+
+_speaker_samples() {
+    local context state state_descr line
+    typeset -A opt_args
+
+    local -a commands
+    commands=(
+        'extract:Extract samples from audio'
+        'segments:Output segment times as JSONL'
+        'list:List stored samples'
+        'info:Show sample metadata'
+        'remove:Remove samples'
+        'speakers:List speakers in transcript'
+        'review:Review samples (approve/reject)'
+    )
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[Show help message]' \
+        '(-q --quiet)'{-q,--quiet}'[Suppress status messages]' \
+        '1: :->command' \
+        '*:: :->args' && return 0
+
+    case "$state" in
+        command)
+            _describe -t commands 'speaker_samples commands' commands
+            ;;
+        args)
+            case "$words[1]" in
+                extract)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-t --transcript)'{-t,--transcript}'[Transcript JSON file]:transcript:_files -g "*.json"' \
+                        '(-l --speaker-label)'{-l,--speaker-label}'[Speaker label in transcript]:label:' \
+                        '(-s --speaker-id)'{-s,--speaker-id}'[Target speaker ID for storage]:speaker_id:' \
+                        '--format[Output format]:format:(mp3 wav)' \
+                        '--min-duration[Minimum segment duration (sec)]:duration:' \
+                        '--max-gap[Max gap to merge segments (sec)]:gap:' \
+                        '--max-segments[Maximum segments to extract]:count:' \
+                        '--max-duration[Maximum total duration (sec)]:duration:' \
+                        '(-n --dry-run)'{-n,--dry-run}'[Show what would be extracted]' \
+                        '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
+                        ':audio_file:_files -g "*.(wav|mp3|flac|ogg|m4a|aac)"'
+                    ;;
+                segments)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-t --transcript)'{-t,--transcript}'[Transcript JSON file]:transcript:_files -g "*.json"' \
+                        '(-l --speaker-label)'{-l,--speaker-label}'[Speaker label]:label:' \
+                        '(-s --speaker-id)'{-s,--speaker-id}'[Speaker ID for output]:speaker_id:' \
+                        '(-a --audio)'{-a,--audio}'[Audio file path (for output)]:audio:_files -g "*.(wav|mp3|flac|ogg|m4a|aac)"' \
+                        '--min-duration[Minimum segment duration]:duration:' \
+                        '--max-gap[Max gap to merge]:gap:'
+                    ;;
+                list)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--format[Output format]:format:(table json)' \
+                        '--show-review[Show review status]' \
+                        '--status[Filter by review status]:status:(pending reviewed rejected)' \
+                        '--limit[Maximum number of results]:limit:' \
+                        '--offset[Skip first N results]:offset:' \
+                        '::speaker_id:'
+                    ;;
+                info)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--format[Output format]:format:(yaml json)' \
+                        ':speaker_id:' \
+                        ':sample_id:'
+                    ;;
+                remove)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--all[Remove all samples]' \
+                        '--source[Remove samples from matching source path]:source:' \
+                        '(-f --force)'{-f,--force}'[Skip confirmation]' \
+                        '(-n --dry-run)'{-n,--dry-run}'[Show what would be removed]' \
+                        ':speaker_id:' \
+                        '::sample_id:'
+                    ;;
+                speakers)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        ':transcript:_files -g "*.json"'
+                    ;;
+                review)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--source-b3sum[Review all samples from source with this b3sum prefix]:b3sum:' \
+                        '--approve[Mark as reviewed/approved]' \
+                        '--reject[Mark as rejected]' \
+                        '--notes[Review notes]:notes:' \
+                        '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
+                        ':speaker_id:' \
+                        '::sample_id:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_speaker_samples "$@"

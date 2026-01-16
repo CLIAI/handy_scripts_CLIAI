@@ -583,6 +583,12 @@ def cmd_list(args) -> int:
                 "review_status": review_status,
             })
 
+        # Apply pagination (offset and limit)
+        if args.offset:
+            sample_data = sample_data[args.offset:]
+        if args.limit:
+            sample_data = sample_data[:args.limit]
+
         if args.format == "json":
             output = []
             for item in sample_data:
@@ -644,6 +650,12 @@ def cmd_list(args) -> int:
                         "reviewed": counts["reviewed"],
                         "rejected": counts["rejected"],
                     })
+
+        # Apply pagination (offset and limit)
+        if args.offset:
+            speakers = speakers[args.offset:]
+        if args.limit:
+            speakers = speakers[:args.limit]
 
         if args.format == "json":
             print(json.dumps(speakers, indent=2))
@@ -955,6 +967,8 @@ def main():
     list_parser.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
     list_parser.add_argument("--show-review", action="store_true", help="Show review status")
     list_parser.add_argument("--status", choices=["pending", "reviewed", "rejected"], help="Filter by review status")
+    list_parser.add_argument("--limit", type=int, help="Maximum number of results to display")
+    list_parser.add_argument("--offset", type=int, default=0, help="Skip first N results (for pagination)")
     list_parser.set_defaults(func=cmd_list)
 
     # info command

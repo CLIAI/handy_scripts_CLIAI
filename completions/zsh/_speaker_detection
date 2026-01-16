@@ -1,0 +1,168 @@
+#compdef speaker_detection
+
+# Zsh completion for speaker_detection CLI
+# Place in a directory in your $fpath (e.g., ~/.zsh/completions/)
+
+_speaker_detection() {
+    local context state state_descr line
+    typeset -A opt_args
+
+    local -a commands
+    commands=(
+        'add:Add a new speaker'
+        'list:List speakers'
+        'show:Show speaker details'
+        'update:Update speaker'
+        'delete:Delete speaker'
+        'tag:Manage speaker tags'
+        'export:Export speakers for STT'
+        'query:Query with jq expression'
+        'enroll:Enroll speaker from audio'
+        'embeddings:List speaker embeddings'
+        'remove-embedding:Remove an embedding'
+        'identify:Identify speaker in audio'
+        'verify:Verify speaker in audio'
+        'check-validity:Check embedding validity based on sample review states'
+        'validate:Validate schema of profiles and embeddings'
+    )
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[Show help message]' \
+        '(-q --quiet)'{-q,--quiet}'[Suppress status messages]' \
+        '1: :->command' \
+        '*:: :->args' && return 0
+
+    case "$state" in
+        command)
+            _describe -t commands 'speaker_detection commands' commands
+            ;;
+        args)
+            case "$words[1]" in
+                add)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--name[Default display name]:name:' \
+                        '*--name-context[Context-specific name (CTX=NAME)]:context=name:' \
+                        '*--nickname[Nickname]:nickname:' \
+                        '--description[Speaker description]:description:' \
+                        '*--tag[Tag]:tag:' \
+                        '*--metadata[Metadata (KEY=VALUE)]:key=value:' \
+                        ':speaker_id:'
+                    ;;
+                list)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--tags[Filter by tags (comma-separated, AND logic)]:tags:' \
+                        '--any-tag[Filter by tags (comma-separated, OR logic)]:tags:' \
+                        '--format[Output format]:format:(table json ids)' \
+                        '--context[Name context for display]:context:' \
+                        '--limit[Maximum number of results]:limit:' \
+                        '--offset[Skip first N results]:offset:'
+                    ;;
+                show)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--format[Output format]:format:(json yaml)' \
+                        ':speaker_id:'
+                    ;;
+                update)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--name[Update default name]:name:' \
+                        '*--name-context[Add/update context-specific name]:context=name:' \
+                        '--description[Update description]:description:' \
+                        '*--nickname[Add nickname]:nickname:' \
+                        '*--remove-nickname[Remove nickname]:nickname:' \
+                        '*--tag[Add tag]:tag:' \
+                        '*--remove-tag[Remove tag]:tag:' \
+                        '*--metadata[Add/update metadata (KEY=VALUE)]:key=value:' \
+                        ':speaker_id:'
+                    ;;
+                delete)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-f --force)'{-f,--force}'[Skip confirmation prompt]' \
+                        '(-n --dry-run)'{-n,--dry-run}'[Show what would be deleted without deleting]' \
+                        ':speaker_id:'
+                    ;;
+                tag)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--add[Tag to add]:tag:' \
+                        '--remove[Tag to remove]:tag:' \
+                        ':speaker_id:'
+                    ;;
+                export)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '--tags[Filter by tags (comma-separated)]:tags:' \
+                        '--context[Name context for export]:context:' \
+                        '--format[Export format]:format:(json speechmatics)' \
+                        '(-o --output)'{-o,--output}'[Output file]:output file:_files'
+                    ;;
+                query)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        ':jq_expression:'
+                    ;;
+                enroll)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-b --backend)'{-b,--backend}'[Embedding backend]:backend:(speechmatics)' \
+                        '(-s --segments)'{-s,--segments}'[Time segments (start:end,start:end)]:segments:' \
+                        '(-t --from-transcript)'{-t,--from-transcript}'[Extract segments from transcript JSON]:transcript:_files -g "*.json"' \
+                        '(-l --speaker-label)'{-l,--speaker-label}'[Speaker label in transcript]:label:' \
+                        '--from-stdin[Read segments from stdin]' \
+                        '(-n --dry-run)'{-n,--dry-run}'[Show what would be enrolled]' \
+                        ':speaker_id:' \
+                        ':audio_file:_files -g "*.(wav|mp3|flac|ogg|m4a|aac)"'
+                    ;;
+                embeddings)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-b --backend)'{-b,--backend}'[Filter by backend]:backend:(speechmatics)' \
+                        '--show-trust[Show trust level and sample counts]' \
+                        ':speaker_id:'
+                    ;;
+                remove-embedding)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        ':speaker_id:' \
+                        ':embedding_id:'
+                    ;;
+                identify)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-b --backend)'{-b,--backend}'[Embedding backend]:backend:(speechmatics)' \
+                        '--tags[Filter candidates by tags (comma-separated)]:tags:' \
+                        '--threshold[Similarity threshold]:threshold:' \
+                        ':audio_file:_files -g "*.(wav|mp3|flac|ogg|m4a|aac)"'
+                    ;;
+                verify)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-b --backend)'{-b,--backend}'[Embedding backend]:backend:(speechmatics)' \
+                        '--threshold[Similarity threshold]:threshold:' \
+                        ':speaker_id:' \
+                        ':audio_file:_files -g "*.(wav|mp3|flac|ogg|m4a|aac)"'
+                    ;;
+                check-validity)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-v --verbose)'{-v,--verbose}'[Show all embeddings, not just issues]' \
+                        '::speaker_id:'
+                    ;;
+                validate)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help message]' \
+                        '(-v --verbose)'{-v,--verbose}'[Show OK profiles too]' \
+                        '(-q --quiet)'{-q,--quiet}'[Only show summary]' \
+                        '--strict[Return non-zero exit code on warnings]' \
+                        '::speaker_id:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_speaker_detection "$@"
