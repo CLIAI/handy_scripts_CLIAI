@@ -586,6 +586,18 @@ def cmd_delete(args) -> int:
         print(f"Error: Speaker '{speaker_id}' not found.", file=sys.stderr)
         return 1
 
+    # Dry-run mode: show what would be deleted
+    if getattr(args, "dry_run", False):
+        print(f"Would delete speaker: {speaker_id}")
+        print(f"  Profile: {get_speaker_path(speaker_id)}")
+        emb_dir = get_embeddings_path() / speaker_id
+        if emb_dir.exists():
+            print(f"  Embeddings: {emb_dir}")
+        samples_dir = get_samples_path() / speaker_id
+        if samples_dir.exists():
+            print(f"  Samples: {samples_dir}")
+        return 0
+
     if not args.force:
         response = input(f"Delete speaker '{speaker_id}'? [y/N] ")
         if response.lower() != "y":
@@ -601,7 +613,8 @@ def cmd_delete(args) -> int:
         import shutil
         shutil.rmtree(emb_dir)
 
-    print(f"Deleted speaker: {speaker_id}")
+    if not getattr(args, "quiet", False):
+        print(f"Deleted speaker: {speaker_id}")
     return 0
 
 
@@ -797,6 +810,20 @@ def cmd_enroll(args) -> int:
             print(f"Error extracting segments: {e}", file=sys.stderr)
             return 1
 
+    # Dry-run mode: show what would be enrolled
+    if getattr(args, "dry_run", False):
+        print(f"Would enroll speaker: {speaker_id}")
+        print(f"  Audio: {audio_path}")
+        print(f"  Backend: {backend_name}")
+        if segments:
+            total_duration = sum(end - start for start, end in segments)
+            print(f"  Segments: {len(segments)} ({total_duration:.1f}s total)")
+            for i, (start, end) in enumerate(segments[:5]):  # Show first 5
+                print(f"    {i+1}. {start:.2f}s - {end:.2f}s ({end-start:.2f}s)")
+            if len(segments) > 5:
+                print(f"    ... and {len(segments) - 5} more")
+        return 0
+
     # Load backend
     try:
         from speaker_detection_backends import get_backend
@@ -809,7 +836,8 @@ def cmd_enroll(args) -> int:
         return 1
 
     # Run enrollment
-    print(f"Enrolling speaker '{speaker_id}' using {backend_name}...", file=sys.stderr)
+    if not getattr(args, "quiet", False):
+        print(f"Enrolling speaker '{speaker_id}' using {backend_name}...", file=sys.stderr)
     try:
         result = backend.enroll_speaker(audio_path, segments)
     except Exception as e:
@@ -1178,6 +1206,10 @@ def main():
         description="Speaker detection and embedding management CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Global options
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress status messages (still outputs data)")
+
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # add command
@@ -1229,6 +1261,8 @@ def main():
     delete_parser.add_argument("id", help="Speaker ID")
     delete_parser.add_argument("--force", "-f", action="store_true",
                               help="Skip confirmation prompt")
+    delete_parser.add_argument("-n", "--dry-run", action="store_true",
+                              help="Show what would be deleted without deleting")
     delete_parser.set_defaults(func=cmd_delete)
 
     # tag command
@@ -1263,6 +1297,8 @@ def main():
                                help="Extract segments from transcript JSON")
     enroll_parser.add_argument("--speaker-label", "-l",
                                help="Speaker label in transcript (e.g., 'A', 'S1')")
+    enroll_parser.add_argument("-n", "--dry-run", action="store_true",
+                               help="Show what would be enrolled without making API calls")
     enroll_parser.set_defaults(func=cmd_enroll)
 
     # embeddings command

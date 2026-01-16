@@ -745,6 +745,16 @@ def cmd_remove(args) -> int:
         print("No matching samples found.")
         return 0
 
+    # Dry-run mode: show what would be removed
+    if getattr(args, "dry_run", False):
+        print(f"Would remove {len(to_remove)} samples:")
+        for sample in to_remove:
+            print(f"  {sample.stem}")
+            meta_path = sample.with_suffix("").with_suffix(".meta.yaml")
+            if meta_path.exists():
+                print(f"    + {meta_path.name}")
+        return 0
+
     if not args.force:
         print(f"Will remove {len(to_remove)} samples:")
         for s in to_remove[:5]:
@@ -766,7 +776,8 @@ def cmd_remove(args) -> int:
                 meta_path.unlink()
         removed += 1
 
-    print(f"Removed {removed} samples")
+    if not getattr(args, "quiet", False):
+        print(f"Removed {removed} samples")
 
     # Remove empty directory
     if not any(speaker_dir.iterdir()):
@@ -907,6 +918,10 @@ def main():
         description="Voice sample extraction and management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Global options
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress status messages (still outputs data)")
+
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # extract command
@@ -956,6 +971,7 @@ def main():
     remove_parser.add_argument("--all", action="store_true", help="Remove all samples")
     remove_parser.add_argument("--source", help="Remove samples from matching source path")
     remove_parser.add_argument("-f", "--force", action="store_true", help="Skip confirmation")
+    remove_parser.add_argument("-n", "--dry-run", action="store_true", help="Show what would be removed")
     remove_parser.set_defaults(func=cmd_remove)
 
     # speakers command (utility to inspect transcript)
