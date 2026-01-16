@@ -244,21 +244,43 @@ elif args.format == "ids":
 
 ## Environment Variables
 
-### Naming Convention
+### CRITICAL: Always Check Env Vars First
 
-```
-TOOL_NAME_SETTING      # Tool-specific
-SPEAKERS_EMBEDDINGS_DIR  # Shared across speaker tools
-```
-
-### Defaults
+**Every script MUST check environment variables before using defaults.** This enables test isolation:
 
 ```python
+# CORRECT - env var first, then default
 DEFAULT_DIR = os.path.expanduser("~/.config/tool_name")
 
 def get_data_dir() -> Path:
     return Path(os.environ.get("TOOL_NAME_DIR", DEFAULT_DIR))
+
+# INCORRECT - hardcoded (breaks test isolation!)
+def get_data_dir() -> Path:
+    return Path.home() / ".config" / "tool_name"  # BAD!
 ```
+
+**Why this matters:**
+
+* Tests set `SPEAKERS_EMBEDDINGS_DIR=/tmp/test_$$` for isolation
+* CI/CD can point to ephemeral directories
+* Multiple test runs don't interfere
+
+### Naming Convention
+
+```
+TOOL_NAME_SETTING        # Tool-specific
+SPEAKERS_EMBEDDINGS_DIR  # Shared across speaker tools
+SPEAKER_DETECTION_DEBUG  # Debug flags
+```
+
+### Standard Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `SPEAKERS_EMBEDDINGS_DIR` | All speaker data | `~/.config/speakers_embeddings` |
+| `SPEAKER_DETECTION_BACKEND` | Default backend | `speechmatics` |
+| `SPEECHMATICS_API_KEY` | API access | (none) |
 
 ## Error Handling
 
@@ -281,24 +303,54 @@ def validate_id(id: str) -> bool:
 
 ## Testing
 
+**See [evals/TESTING.md](evals/TESTING.md) for comprehensive testing documentation.**
+
+### Key Principles
+
+1. **Reproducible audio** - Use espeak-ng for synthetic voices
+2. **Isolated directories** - Always use env vars, never hardcode paths
+3. **Docker-first** - All tests runnable in `evals/Dockerfile.test`
+
 ### Test Directory Structure
 
 ```
 evals/
+├── TESTING.md            # Comprehensive testing docs
+├── Dockerfile.test       # Reproducible test environment
 └── tool_name/
+    ├── Makefile          # Audio generation
+    ├── audio/            # Generated audio (gitignored)
+    ├── samples/          # Reference transcripts
     ├── test_cli.py       # CLI integration tests
-    ├── test_functions.py # Unit tests for core functions
     ├── benchmark.py      # Performance benchmarks
-    └── fixtures/         # Test data
+    └── test_all.sh       # Run all tests
+```
+
+### Running Tests
+
+```bash
+# Local (requires espeak-ng, ffmpeg)
+cd evals/speaker_detection
+make all           # Generate test audio
+./test_all.sh      # Run tests
+
+# Docker (reproducible)
+docker build -f evals/Dockerfile.test -t speaker-tools-test .
+docker run --rm speaker-tools-test
 ```
 
 ### Import for Testing
 
 ```python
-# In test_functions.py
+# In test_cli.py - set env BEFORE imports!
+import os
+import tempfile
+TEST_DIR = tempfile.mkdtemp(prefix="test_")
+os.environ["SPEAKERS_EMBEDDINGS_DIR"] = TEST_DIR
+
+# Now import
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
 from speaker_detection import load_speaker, compute_b3sum
 ```
 
