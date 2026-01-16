@@ -25,14 +25,23 @@ except ImportError:
 from .base import EmbeddingBackend
 
 
+# API version - update when Speechmatics releases new API versions
+API_VERSION = "v2"
+
 # API regions
 REGIONS = {
-    'eu': 'https://eu1.asr.api.speechmatics.com/v2',
-    'eu1': 'https://eu1.asr.api.speechmatics.com/v2',
-    'us': 'https://us1.asr.api.speechmatics.com/v2',
-    'us1': 'https://us1.asr.api.speechmatics.com/v2',
-    'au': 'https://au1.asr.api.speechmatics.com/v2',
-    'au1': 'https://au1.asr.api.speechmatics.com/v2',
+    'eu': f'https://eu1.asr.api.speechmatics.com/{API_VERSION}',
+    'eu1': f'https://eu1.asr.api.speechmatics.com/{API_VERSION}',
+    'us': f'https://us1.asr.api.speechmatics.com/{API_VERSION}',
+    'us1': f'https://us1.asr.api.speechmatics.com/{API_VERSION}',
+    'au': f'https://au1.asr.api.speechmatics.com/{API_VERSION}',
+    'au1': f'https://au1.asr.api.speechmatics.com/{API_VERSION}',
+}
+
+# Compatible model versions for identification
+# Embeddings created with older versions may not work with newer API
+COMPATIBLE_MODEL_VERSIONS = {
+    "speechmatics-v2",  # Current version
 }
 
 
@@ -80,6 +89,47 @@ class SpeechmaticsBackend(EmbeddingBackend):
     @property
     def requires_api_key(self) -> bool:
         return True
+
+    @property
+    def api_version(self) -> str:
+        """Current API version string."""
+        return API_VERSION
+
+    @property
+    def model_version(self) -> str:
+        """Model version string stored in embeddings."""
+        return f"speechmatics-{API_VERSION}"
+
+    def check_embedding_compatibility(
+        self,
+        embedding: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Check if an embedding is compatible with current API version.
+
+        Args:
+            embedding: Embedding dict with model_version field
+
+        Returns:
+            Dict with:
+            - compatible: bool
+            - version: embedding's model_version
+            - current: current model_version
+            - warning: warning message if incompatible
+        """
+        emb_version = embedding.get("model_version", "unknown")
+        result = {
+            "compatible": emb_version in COMPATIBLE_MODEL_VERSIONS,
+            "version": emb_version,
+            "current": self.model_version,
+            "warning": None,
+        }
+        if not result["compatible"]:
+            result["warning"] = (
+                f"Embedding created with {emb_version} may not work with "
+                f"current API {self.model_version}. Consider re-enrolling."
+            )
+        return result
 
     def _headers(self) -> Dict[str, str]:
         """Get API request headers."""
@@ -293,7 +343,7 @@ class SpeechmaticsBackend(EmbeddingBackend):
             return {
                 "external_id": identifiers[0],  # Primary identifier
                 "all_identifiers": identifiers,  # All generated identifiers
-                "model_version": "speechmatics-v2",
+                "model_version": f"speechmatics-{API_VERSION}",
                 "source_audio": str(audio_path),
                 "source_segments": segments,
                 "region": self._region,
@@ -335,6 +385,20 @@ class SpeechmaticsBackend(EmbeddingBackend):
         for candidate in candidates:
             speaker_id = candidate.get("id")
             embeddings = candidate.get("embeddings", {}).get("speechmatics", [])
+
+            if not embeddings:
+                continue
+
+            # Check compatibility and warn if needed
+            for emb in embeddings:
+                compat = self.check_embedding_compatibility(emb)
+                if not compat["compatible"]:
+                    import sys
+                    print(
+                        f"Warning: {speaker_id}: {compat['warning']}",
+                        file=sys.stderr,
+                    )
+                    break  # Only warn once per speaker
 
             if not embeddings:
                 continue

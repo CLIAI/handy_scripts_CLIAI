@@ -37,6 +37,45 @@ class EmbeddingBackend(ABC):
         """Dimensionality of embeddings (None for API-based backends)."""
         return None
 
+    @property
+    def model_version(self) -> str:
+        """Model version string stored in embeddings."""
+        return f"{self.name}-unknown"
+
+    def check_embedding_compatibility(
+        self,
+        embedding: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Check if an embedding is compatible with current API version.
+
+        Default implementation checks model_version prefix matches backend name.
+
+        Args:
+            embedding: Embedding dict with model_version field
+
+        Returns:
+            Dict with:
+            - compatible: bool
+            - version: embedding's model_version
+            - current: current model_version
+            - warning: warning message if incompatible
+        """
+        emb_version = embedding.get("model_version", "unknown")
+        compatible = emb_version.startswith(f"{self.name}-")
+        result = {
+            "compatible": compatible,
+            "version": emb_version,
+            "current": self.model_version,
+            "warning": None,
+        }
+        if not compatible:
+            result["warning"] = (
+                f"Embedding created with {emb_version} may not work with "
+                f"backend {self.name}. Consider re-enrolling."
+            )
+        return result
+
     @abstractmethod
     def enroll_speaker(
         self,

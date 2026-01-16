@@ -130,6 +130,7 @@ def run_test(case: dict, backend: str, temp_dir: Path, verbose: bool = False) ->
                     "id": f"emb-{speaker_id}",
                     "external_id": enrollment.get("external_id"),
                     "all_identifiers": enrollment.get("all_identifiers", []),
+                    "model_version": enrollment.get("model_version", f"{backend}-v2"),
                     "source_audio": str(audio_path),
                 }]
                 result["enrolled"].append(speaker_id)
