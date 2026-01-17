@@ -1,0 +1,925 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pyyaml>=6.0",
+# ]
+# ///
+"""
+speaker-report - Quality metrics and recommendations for speaker detection system
+
+Provides system health reports, coverage analysis, and actionable recommendations.
+Part of the speaker-* tool ecosystem.
+
+Usage:
+    speaker-report status                          # Overall system status (default)
+    speaker-report coverage [--context NAME]       # Review coverage by context
+    speaker-report confidence [--below PCT]        # Recordings below confidence threshold
+    speaker-report stale [--days N]                # Recordings with old processing
+    speaker-report speakers                        # Speaker enrollment summary
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Optional
+
+# Optional YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+
+# =============================================================================
+# Constants and Configuration
+# =============================================================================
+
+VERSION = "1.0.0"
+SCHEMA_VERSION = 1
+
+# Status values in order of progression
+STATUS_VALUES = ["unprocessed", "transcribed", "assigned", "reviewed", "complete"]
+
+# Trust levels for speakers
+TRUST_LEVELS = ["high", "medium", "low", "unverified"]
+
+# Confidence thresholds
+DEFAULT_CONFIDENCE_THRESHOLD = 70  # Percentage
+
+
+def get_speakers_embeddings_dir() -> Path:
+    """Get the root directory for speaker embeddings storage."""
+    return Path(os.environ.get(
+        "SPEAKERS_EMBEDDINGS_DIR",
+        os.path.expanduser("~/.config/speakers_embeddings")
+    ))
+
+
+def get_catalog_dir() -> Path:
+    """Get the catalog directory."""
+    catalog_dir = get_speakers_embeddings_dir() / "catalog"
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    return catalog_dir
+
+
+def get_assignments_dir() -> Path:
+    """Get the assignments directory."""
+    assignments_dir = get_speakers_embeddings_dir() / "assignments"
+    assignments_dir.mkdir(parents=True, exist_ok=True)
+    return assignments_dir
+
+
+def get_db_dir() -> Path:
+    """Get the speaker profiles directory."""
+    db_dir = get_speakers_embeddings_dir() / "db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return db_dir
+
+
+def get_embeddings_dir() -> Path:
+    """Get the embeddings directory."""
+    embeddings_dir = get_speakers_embeddings_dir() / "embeddings"
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
+    return embeddings_dir
+
+
+def get_samples_dir() -> Path:
+    """Get the samples directory."""
+    samples_dir = get_speakers_embeddings_dir() / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    return samples_dir
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def utc_now_iso() -> str:
+    """Return current UTC time in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso_datetime(s: str) -> Optional[datetime]:
+    """Parse ISO datetime string."""
+    if not s:
+        return None
+    try:
+        # Handle multiple formats
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%S",
+        ]:
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def load_yaml(path: Path) -> dict:
+    """Load YAML file, with JSON fallback."""
+    with open(path, "r") as f:
+        content = f.read()
+    if YAML_AVAILABLE:
+        return yaml.safe_load(content) or {}
+    else:
+        return json.loads(content)
+
+
+def days_since(iso_str: str) -> Optional[int]:
+    """Calculate days since an ISO datetime string."""
+    dt = parse_iso_datetime(iso_str)
+    if not dt:
+        return None
+    now = datetime.now(timezone.utc)
+    return (now - dt).days
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class CatalogEntry:
+    """A recording in the catalog."""
+    b3sum: str
+    path: str
+    duration_sec: Optional[float]
+    status: str
+    context_name: Optional[str]
+    expected_speakers: list[str]
+    tags: list[str]
+    transcriptions: list[dict]
+    review_status: str
+    updated_at: str
+    discovered_at: str
+
+
+@dataclass
+class SpeakerProfile:
+    """A speaker profile."""
+    speaker_id: str
+    display_name: Optional[str]
+    trust_level: str
+    enrollment_count: int
+    sample_count: int
+    embedding_count: int
+    reviewed_samples: int
+    last_updated: Optional[str]
+
+
+@dataclass
+class Assignment:
+    """Speaker assignment for a recording."""
+    b3sum: str
+    mappings: dict[str, dict]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
+class SystemStats:
+    """System-wide statistics."""
+    total_recordings: int = 0
+    processed: int = 0
+    reviewed: int = 0
+    pending: int = 0
+
+    total_speakers: int = 0
+    high_trust: int = 0
+    medium_trust: int = 0
+    low_trust: int = 0
+    unverified: int = 0
+
+    total_contexts: int = 0
+    contexts: dict = field(default_factory=dict)
+
+    low_confidence_count: int = 0
+    speakers_needing_samples: list[str] = field(default_factory=list)
+    stale_recordings: int = 0
+
+    recommendations: list[str] = field(default_factory=list)
+
+
+# =============================================================================
+# Data Loading
+# =============================================================================
+
+def load_all_catalog_entries() -> list[CatalogEntry]:
+    """Load all catalog entries."""
+    catalog_dir = get_catalog_dir()
+    entries = []
+
+    for entry_file in sorted(catalog_dir.glob("*.yaml")):
+        try:
+            data = load_yaml(entry_file)
+            b3sum = entry_file.stem
+
+            recording = data.get("recording", {})
+            context = data.get("context", {})
+            review = data.get("review", {})
+
+            # Compute status
+            status = compute_status(data, b3sum)
+
+            entries.append(CatalogEntry(
+                b3sum=b3sum,
+                path=recording.get("path", ""),
+                duration_sec=recording.get("duration_sec"),
+                status=status,
+                context_name=context.get("name"),
+                expected_speakers=context.get("expected_speakers", []),
+                tags=context.get("tags", []),
+                transcriptions=data.get("transcriptions", []),
+                review_status=review.get("status", "none"),
+                updated_at=data.get("updated_at", ""),
+                discovered_at=recording.get("discovered_at", ""),
+            ))
+        except Exception as e:
+            print(f"Warning: Failed to load {entry_file}: {e}", file=sys.stderr)
+
+    return entries
+
+
+def compute_status(entry: dict, b3sum: str) -> str:
+    """Compute the current status of a catalog entry."""
+    transcriptions = entry.get("transcriptions", [])
+    if not transcriptions:
+        return "unprocessed"
+
+    assignments_path = get_assignments_dir() / f"{b3sum}.yaml"
+    if not assignments_path.exists():
+        return "transcribed"
+
+    review = entry.get("review", {})
+    review_status = review.get("status", "none")
+
+    if review_status == "complete":
+        return "complete"
+    elif review_status == "partial":
+        return "reviewed"
+    else:
+        return "assigned"
+
+
+def load_all_speaker_profiles() -> list[SpeakerProfile]:
+    """Load all speaker profiles."""
+    db_dir = get_db_dir()
+    profiles = []
+
+    for profile_file in sorted(db_dir.glob("*.yaml")):
+        try:
+            data = load_yaml(profile_file)
+            speaker_id = profile_file.stem
+
+            # Count samples
+            samples_dir = get_samples_dir() / speaker_id
+            sample_count = len(list(samples_dir.glob("*.wav"))) if samples_dir.exists() else 0
+
+            # Count embeddings
+            embeddings_dir = get_embeddings_dir() / speaker_id
+            embedding_count = len(list(embeddings_dir.glob("*.npy"))) if embeddings_dir.exists() else 0
+
+            # Count reviewed samples
+            reviewed_samples = 0
+            for sample in data.get("samples", []):
+                if sample.get("reviewed"):
+                    reviewed_samples += 1
+
+            profiles.append(SpeakerProfile(
+                speaker_id=speaker_id,
+                display_name=data.get("display_name"),
+                trust_level=data.get("trust_level", "unverified"),
+                enrollment_count=data.get("enrollment_count", 0),
+                sample_count=sample_count,
+                embedding_count=embedding_count,
+                reviewed_samples=reviewed_samples,
+                last_updated=data.get("updated_at"),
+            ))
+        except Exception as e:
+            print(f"Warning: Failed to load {profile_file}: {e}", file=sys.stderr)
+
+    return profiles
+
+
+def load_all_assignments() -> list[Assignment]:
+    """Load all assignments."""
+    assignments_dir = get_assignments_dir()
+    assignments = []
+
+    for assign_file in sorted(assignments_dir.glob("*.yaml")):
+        try:
+            data = load_yaml(assign_file)
+            b3sum = assign_file.stem
+
+            assignments.append(Assignment(
+                b3sum=b3sum,
+                mappings=data.get("mappings", {}),
+                created_at=data.get("created_at"),
+                updated_at=data.get("updated_at"),
+            ))
+        except Exception as e:
+            print(f"Warning: Failed to load {assign_file}: {e}", file=sys.stderr)
+
+    return assignments
+
+
+# =============================================================================
+# Report Generation
+# =============================================================================
+
+def compute_system_stats(
+    entries: list[CatalogEntry],
+    profiles: list[SpeakerProfile],
+    assignments: list[Assignment],
+    confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
+    stale_days: int = 30,
+) -> SystemStats:
+    """Compute system-wide statistics."""
+    stats = SystemStats()
+
+    # Recording stats
+    stats.total_recordings = len(entries)
+    for entry in entries:
+        if entry.status == "unprocessed":
+            stats.pending += 1
+        elif entry.status in ["transcribed", "assigned"]:
+            stats.processed += 1
+        elif entry.status in ["reviewed", "complete"]:
+            stats.reviewed += 1
+            stats.processed += 1
+
+    # Context stats
+    contexts = defaultdict(lambda: {"total": 0, "reviewed": 0})
+    for entry in entries:
+        ctx = entry.context_name or "(no context)"
+        contexts[ctx]["total"] += 1
+        if entry.status in ["reviewed", "complete"]:
+            contexts[ctx]["reviewed"] += 1
+    stats.total_contexts = len([c for c in contexts if c != "(no context)"])
+    stats.contexts = dict(contexts)
+
+    # Speaker stats
+    stats.total_speakers = len(profiles)
+    for profile in profiles:
+        if profile.trust_level == "high":
+            stats.high_trust += 1
+        elif profile.trust_level == "medium":
+            stats.medium_trust += 1
+        elif profile.trust_level == "low":
+            stats.low_trust += 1
+        else:
+            stats.unverified += 1
+
+    # Low confidence assignments
+    for assignment in assignments:
+        for label, mapping in assignment.mappings.items():
+            confidence_str = mapping.get("confidence", "low")
+            # Convert string confidence to numeric
+            confidence_map = {"high": 90, "medium": 70, "low": 40, "unassigned": 0}
+            confidence = confidence_map.get(confidence_str, 0)
+            if confidence < confidence_threshold:
+                stats.low_confidence_count += 1
+
+    # Speakers needing more samples
+    for profile in profiles:
+        if profile.reviewed_samples < 3:
+            stats.speakers_needing_samples.append(profile.speaker_id)
+
+    # Stale recordings
+    for entry in entries:
+        if entry.status not in ["complete"]:
+            age = days_since(entry.updated_at)
+            if age and age > stale_days:
+                stats.stale_recordings += 1
+
+    # Generate recommendations
+    stats.recommendations = generate_recommendations(stats, entries, profiles, assignments)
+
+    return stats
+
+
+def generate_recommendations(
+    stats: SystemStats,
+    entries: list[CatalogEntry],
+    profiles: list[SpeakerProfile],
+    assignments: list[Assignment],
+) -> list[str]:
+    """Generate actionable recommendations."""
+    recommendations = []
+
+    if stats.low_confidence_count > 0:
+        recommendations.append(
+            f"{stats.low_confidence_count} recording(s) have low-confidence assignments"
+        )
+
+    if stats.speakers_needing_samples:
+        count = len(stats.speakers_needing_samples)
+        if count <= 3:
+            names = ", ".join(stats.speakers_needing_samples)
+            recommendations.append(f"Speaker(s) {names} need more reviewed samples")
+        else:
+            recommendations.append(f"{count} speakers need more reviewed samples")
+
+    if stats.pending > 0:
+        recommendations.append(
+            f"{stats.pending} recording(s) pending transcription"
+        )
+
+    if stats.stale_recordings > 0:
+        recommendations.append(
+            f"{stats.stale_recordings} recording(s) have not been updated recently"
+        )
+
+    # Check for unassigned speakers in contexts
+    unassigned_contexts = []
+    for ctx_name, ctx_data in stats.contexts.items():
+        if ctx_name != "(no context)" and ctx_data["reviewed"] == 0 and ctx_data["total"] > 0:
+            unassigned_contexts.append(ctx_name)
+    if unassigned_contexts:
+        if len(unassigned_contexts) <= 2:
+            recommendations.append(
+                f"Context(s) '{', '.join(unassigned_contexts)}' have no reviewed recordings"
+            )
+        else:
+            recommendations.append(
+                f"{len(unassigned_contexts)} contexts have no reviewed recordings"
+            )
+
+    return recommendations
+
+
+# =============================================================================
+# Output Formatting
+# =============================================================================
+
+def format_status_report(stats: SystemStats, format_type: str) -> str:
+    """Format the status report."""
+    if format_type == "json":
+        return json.dumps({
+            "recordings": {
+                "total": stats.total_recordings,
+                "processed": stats.processed,
+                "reviewed": stats.reviewed,
+                "pending": stats.pending,
+            },
+            "speakers": {
+                "total": stats.total_speakers,
+                "high_trust": stats.high_trust,
+                "medium_trust": stats.medium_trust,
+                "low_trust": stats.low_trust,
+                "unverified": stats.unverified,
+            },
+            "contexts": {
+                "total": stats.total_contexts,
+                "details": stats.contexts,
+            },
+            "issues": {
+                "low_confidence_count": stats.low_confidence_count,
+                "speakers_needing_samples": stats.speakers_needing_samples,
+                "stale_recordings": stats.stale_recordings,
+            },
+            "recommendations": stats.recommendations,
+        }, indent=2, ensure_ascii=False)
+
+    # Text format
+    lines = []
+    lines.append("Speaker Detection System Status")
+    lines.append("=" * 32)
+
+    # Recording stats
+    total = stats.total_recordings
+    processed_pct = (stats.processed / total * 100) if total > 0 else 0
+    reviewed_pct = (stats.reviewed / total * 100) if total > 0 else 0
+
+    lines.append(f"Recordings:     {total} total")
+    lines.append(f"  - Processed:  {stats.processed} ({processed_pct:.0f}%)")
+    lines.append(f"  - Reviewed:   {stats.reviewed} ({reviewed_pct:.0f}%)")
+    lines.append(f"  - Pending:    {stats.pending}")
+    lines.append("")
+
+    # Speaker stats
+    lines.append(f"Speakers:       {stats.total_speakers} enrolled")
+    lines.append(f"  - High trust: {stats.high_trust}")
+    lines.append(f"  - Medium:     {stats.medium_trust}")
+    lines.append(f"  - Low:        {stats.low_trust}")
+    if stats.unverified > 0:
+        lines.append(f"  - Unverified: {stats.unverified}")
+    lines.append("")
+
+    # Context stats
+    lines.append(f"Contexts:       {stats.total_contexts} defined")
+    for ctx_name, ctx_data in sorted(stats.contexts.items()):
+        if ctx_name != "(no context)":
+            lines.append(f"  - {ctx_name}: {ctx_data['total']} recordings, {ctx_data['reviewed']} reviewed")
+    lines.append("")
+
+    # Recommendations
+    if stats.recommendations:
+        lines.append("Recommendations:")
+        for rec in stats.recommendations:
+            lines.append(f"  - {rec}")
+    else:
+        lines.append("No issues detected.")
+
+    return "\n".join(lines)
+
+
+def format_coverage_report(
+    entries: list[CatalogEntry],
+    context_filter: Optional[str],
+    format_type: str,
+) -> str:
+    """Format coverage report by context."""
+    # Group by context
+    contexts = defaultdict(lambda: {
+        "total": 0,
+        "unprocessed": 0,
+        "transcribed": 0,
+        "assigned": 0,
+        "reviewed": 0,
+        "complete": 0,
+        "recordings": [],
+    })
+
+    for entry in entries:
+        ctx = entry.context_name or "(no context)"
+        if context_filter and ctx != context_filter:
+            continue
+
+        contexts[ctx]["total"] += 1
+        contexts[ctx][entry.status] += 1
+        contexts[ctx]["recordings"].append({
+            "b3sum": entry.b3sum,
+            "path": entry.path,
+            "status": entry.status,
+        })
+
+    if format_type == "json":
+        return json.dumps(dict(contexts), indent=2, ensure_ascii=False)
+
+    # Text format
+    lines = []
+    lines.append("Coverage by Context")
+    lines.append("=" * 20)
+    lines.append("")
+
+    for ctx_name, ctx_data in sorted(contexts.items()):
+        total = ctx_data["total"]
+        complete_pct = ((ctx_data["reviewed"] + ctx_data["complete"]) / total * 100) if total > 0 else 0
+
+        lines.append(f"Context: {ctx_name}")
+        lines.append(f"  Total:       {total}")
+        lines.append(f"  Unprocessed: {ctx_data['unprocessed']}")
+        lines.append(f"  Transcribed: {ctx_data['transcribed']}")
+        lines.append(f"  Assigned:    {ctx_data['assigned']}")
+        lines.append(f"  Reviewed:    {ctx_data['reviewed']}")
+        lines.append(f"  Complete:    {ctx_data['complete']}")
+        lines.append(f"  Coverage:    {complete_pct:.0f}%")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_confidence_report(
+    entries: list[CatalogEntry],
+    assignments: list[Assignment],
+    threshold: int,
+    format_type: str,
+) -> str:
+    """Format confidence report - recordings below threshold."""
+    # Map b3sum to entry
+    entry_map = {e.b3sum: e for e in entries}
+
+    # Find low confidence assignments
+    low_confidence = []
+    for assignment in assignments:
+        low_mappings = []
+        for label, mapping in assignment.mappings.items():
+            confidence_str = mapping.get("confidence", "low")
+            confidence_map = {"high": 90, "medium": 70, "low": 40, "unassigned": 0}
+            confidence = confidence_map.get(confidence_str, 0)
+
+            if confidence < threshold:
+                low_mappings.append({
+                    "label": label,
+                    "speaker_id": mapping.get("speaker_id"),
+                    "confidence": confidence_str,
+                    "confidence_pct": confidence,
+                })
+
+        if low_mappings:
+            entry = entry_map.get(assignment.b3sum)
+            low_confidence.append({
+                "b3sum": assignment.b3sum,
+                "path": entry.path if entry else "",
+                "context": entry.context_name if entry else None,
+                "mappings": low_mappings,
+            })
+
+    if format_type == "json":
+        return json.dumps({
+            "threshold": threshold,
+            "count": len(low_confidence),
+            "recordings": low_confidence,
+        }, indent=2, ensure_ascii=False)
+
+    # Text format
+    lines = []
+    lines.append(f"Recordings Below {threshold}% Confidence")
+    lines.append("=" * 40)
+    lines.append("")
+
+    if not low_confidence:
+        lines.append("No recordings below threshold.")
+        return "\n".join(lines)
+
+    lines.append(f"Found {len(low_confidence)} recording(s):")
+    lines.append("")
+
+    for rec in low_confidence:
+        path_display = Path(rec["path"]).name if rec["path"] else rec["b3sum"][:8]
+        lines.append(f"  {path_display}")
+        lines.append(f"    B3SUM: {rec['b3sum'][:16]}...")
+        if rec["context"]:
+            lines.append(f"    Context: {rec['context']}")
+        for m in rec["mappings"]:
+            speaker = m["speaker_id"] or "(unassigned)"
+            lines.append(f"    - {m['label']} -> {speaker} ({m['confidence']})")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_stale_report(
+    entries: list[CatalogEntry],
+    days: int,
+    format_type: str,
+) -> str:
+    """Format stale recordings report."""
+    stale = []
+
+    for entry in entries:
+        if entry.status == "complete":
+            continue
+
+        age = days_since(entry.updated_at)
+        if age and age > days:
+            stale.append({
+                "b3sum": entry.b3sum,
+                "path": entry.path,
+                "context": entry.context_name,
+                "status": entry.status,
+                "days_since_update": age,
+                "updated_at": entry.updated_at,
+            })
+
+    # Sort by age descending
+    stale.sort(key=lambda x: x["days_since_update"], reverse=True)
+
+    if format_type == "json":
+        return json.dumps({
+            "threshold_days": days,
+            "count": len(stale),
+            "recordings": stale,
+        }, indent=2, ensure_ascii=False)
+
+    # Text format
+    lines = []
+    lines.append(f"Recordings Not Updated in {days}+ Days")
+    lines.append("=" * 40)
+    lines.append("")
+
+    if not stale:
+        lines.append("No stale recordings found.")
+        return "\n".join(lines)
+
+    lines.append(f"Found {len(stale)} recording(s):")
+    lines.append("")
+
+    for rec in stale:
+        path_display = Path(rec["path"]).name if rec["path"] else rec["b3sum"][:8]
+        lines.append(f"  {path_display}")
+        lines.append(f"    Status: {rec['status']}")
+        lines.append(f"    Last updated: {rec['days_since_update']} days ago")
+        if rec["context"]:
+            lines.append(f"    Context: {rec['context']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_speakers_report(
+    profiles: list[SpeakerProfile],
+    format_type: str,
+) -> str:
+    """Format speaker enrollment summary."""
+    if format_type == "json":
+        return json.dumps({
+            "total": len(profiles),
+            "speakers": [
+                {
+                    "speaker_id": p.speaker_id,
+                    "display_name": p.display_name,
+                    "trust_level": p.trust_level,
+                    "sample_count": p.sample_count,
+                    "embedding_count": p.embedding_count,
+                    "reviewed_samples": p.reviewed_samples,
+                    "last_updated": p.last_updated,
+                }
+                for p in profiles
+            ],
+        }, indent=2, ensure_ascii=False)
+
+    # Text format
+    lines = []
+    lines.append("Speaker Enrollment Summary")
+    lines.append("=" * 26)
+    lines.append("")
+    lines.append(f"Total speakers: {len(profiles)}")
+    lines.append("")
+
+    if not profiles:
+        lines.append("No speakers enrolled.")
+        return "\n".join(lines)
+
+    # Table header
+    lines.append(f"{'ID':<20} {'Name':<20} {'Trust':<10} {'Samples':<8} {'Reviewed':<8}")
+    lines.append("-" * 70)
+
+    for p in sorted(profiles, key=lambda x: x.speaker_id):
+        name = (p.display_name or "-")[:20]
+        lines.append(f"{p.speaker_id:<20} {name:<20} {p.trust_level:<10} {p.sample_count:<8} {p.reviewed_samples:<8}")
+
+    lines.append("")
+
+    # Summary by trust level
+    trust_counts = defaultdict(int)
+    for p in profiles:
+        trust_counts[p.trust_level] += 1
+
+    lines.append("By trust level:")
+    for level in TRUST_LEVELS:
+        if trust_counts[level] > 0:
+            lines.append(f"  - {level}: {trust_counts[level]}")
+
+    # Speakers needing samples
+    need_samples = [p for p in profiles if p.reviewed_samples < 3]
+    if need_samples:
+        lines.append("")
+        lines.append(f"Speakers needing more reviewed samples ({len(need_samples)}):")
+        for p in need_samples[:5]:
+            lines.append(f"  - {p.speaker_id} ({p.reviewed_samples} reviewed)")
+        if len(need_samples) > 5:
+            lines.append(f"  - ... and {len(need_samples) - 5} more")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show overall system status (default command)."""
+    entries = load_all_catalog_entries()
+    profiles = load_all_speaker_profiles()
+    assignments = load_all_assignments()
+
+    stats = compute_system_stats(
+        entries, profiles, assignments,
+        confidence_threshold=args.confidence_threshold,
+        stale_days=args.stale_days,
+    )
+
+    print(format_status_report(stats, args.format))
+    return 0
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Show review coverage by context."""
+    entries = load_all_catalog_entries()
+
+    print(format_coverage_report(entries, args.context, args.format))
+    return 0
+
+
+def cmd_confidence(args: argparse.Namespace) -> int:
+    """Show recordings below confidence threshold."""
+    entries = load_all_catalog_entries()
+    assignments = load_all_assignments()
+
+    print(format_confidence_report(entries, assignments, args.below, args.format))
+    return 0
+
+
+def cmd_stale(args: argparse.Namespace) -> int:
+    """Show recordings with old processing."""
+    entries = load_all_catalog_entries()
+
+    print(format_stale_report(entries, args.days, args.format))
+    return 0
+
+
+def cmd_speakers(args: argparse.Namespace) -> int:
+    """Show speaker enrollment summary."""
+    profiles = load_all_speaker_profiles()
+
+    print(format_speakers_report(profiles, args.format))
+    return 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Quality metrics and recommendations for speaker detection system",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"speaker-report {VERSION}")
+    parser.add_argument(
+        "-f", "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # status command (default)
+    status_parser = subparsers.add_parser("status", help="Overall system status")
+    status_parser.add_argument(
+        "--confidence-threshold",
+        type=int,
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        help=f"Confidence threshold percentage (default: {DEFAULT_CONFIDENCE_THRESHOLD})"
+    )
+    status_parser.add_argument(
+        "--stale-days",
+        type=int,
+        default=30,
+        help="Days threshold for stale recordings (default: 30)"
+    )
+    status_parser.set_defaults(func=cmd_status)
+
+    # coverage command
+    coverage_parser = subparsers.add_parser("coverage", help="Review coverage by context")
+    coverage_parser.add_argument(
+        "-c", "--context",
+        help="Filter by specific context name"
+    )
+    coverage_parser.set_defaults(func=cmd_coverage)
+
+    # confidence command
+    confidence_parser = subparsers.add_parser("confidence", help="Recordings below confidence threshold")
+    confidence_parser.add_argument(
+        "-b", "--below",
+        type=int,
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        help=f"Confidence threshold percentage (default: {DEFAULT_CONFIDENCE_THRESHOLD})"
+    )
+    confidence_parser.set_defaults(func=cmd_confidence)
+
+    # stale command
+    stale_parser = subparsers.add_parser("stale", help="Recordings with old processing")
+    stale_parser.add_argument(
+        "-d", "--days",
+        type=int,
+        default=30,
+        help="Days threshold (default: 30)"
+    )
+    stale_parser.set_defaults(func=cmd_stale)
+
+    # speakers command
+    speakers_parser = subparsers.add_parser("speakers", help="Speaker enrollment summary")
+    speakers_parser.set_defaults(func=cmd_speakers)
+
+    args = parser.parse_args()
+
+    # Default to status command if no subcommand given
+    if args.command is None:
+        args.command = "status"
+        args.confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD
+        args.stale_days = 30
+        args.func = cmd_status
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

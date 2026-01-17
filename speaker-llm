@@ -1,0 +1,840 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pyyaml>=6.0",
+#     "anthropic>=0.18.0",
+#     "openai>=1.0.0",
+#     "requests>=2.28.0",
+# ]
+# ///
+"""
+speaker-llm - LLM-based speaker name detection from transcripts
+
+Detect speaker names from conversation text using LLM analysis.
+Supports multiple LLM providers: Anthropic Claude, OpenAI GPT, and Ollama.
+
+Usage:
+    speaker-llm analyze <transcript>     # Full analysis with evidence
+    speaker-llm detect-names <transcript> # Quick mode, just names
+    speaker-llm providers                 # Show available providers
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+# Optional YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+
+# =============================================================================
+# Constants and Configuration
+# =============================================================================
+
+VERSION = "1.0.0"
+
+# Default models for each provider
+DEFAULT_MODELS = {
+    "anthropic": "claude-3-haiku-20240307",
+    "openai": "gpt-4o-mini",
+    "ollama": "llama3.2",
+}
+
+# Environment variable names for API keys
+ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "ollama": "OLLAMA_HOST",
+}
+
+# Default Ollama host
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+# Detection patterns description for the LLM prompt
+DETECTION_PATTERNS = """
+1. Direct address: "Alice, can you...", "Hey Bob, what about..."
+2. Self-reference: "I'm Bob and I think...", "This is Alice speaking"
+3. Third-person mention: "As Carol mentioned...", "I agree with what Dave said"
+4. Introduction: "Hi, this is Dave", "My name is Eve"
+5. Role-based: "The host John...", "Our guest Dr. Smith..."
+6. Conversation flow: When someone says "Thanks, [name]" after another speaker
+"""
+
+
+def get_cache_dir() -> Path:
+    """Get the cache directory for LLM responses."""
+    cache_dir = Path(os.environ.get(
+        "SPEAKER_LLM_CACHE_DIR",
+        os.path.expanduser("~/.cache/speaker-llm")
+    ))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def utc_now_iso() -> str:
+    """Return current UTC time in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def compute_transcript_hash(transcript_text: str) -> str:
+    """Compute SHA256 hash of transcript text for caching."""
+    return hashlib.sha256(transcript_text.encode()).hexdigest()[:16]
+
+
+# =============================================================================
+# Transcript Parsing
+# =============================================================================
+
+def detect_transcript_format(data: dict) -> str:
+    """Detect transcript format: speechmatics, assemblyai, or unknown."""
+    if "utterances" in data:
+        return "assemblyai"
+    if "results" in data:
+        return "speechmatics"
+    return "unknown"
+
+
+def get_speakers_from_transcript(data: dict) -> list[str]:
+    """Extract unique speaker labels from transcript."""
+    fmt = detect_transcript_format(data)
+    speakers = set()
+
+    if fmt == "assemblyai":
+        for u in data.get("utterances", []):
+            if u.get("speaker"):
+                speakers.add(u["speaker"])
+    elif fmt == "speechmatics":
+        for r in data.get("results", []):
+            for alt in r.get("alternatives", []):
+                if alt.get("speaker"):
+                    speakers.add(alt["speaker"])
+            if r.get("speaker"):
+                speakers.add(r["speaker"])
+
+    return sorted(speakers)
+
+
+def extract_conversation_text(data: dict) -> str:
+    """Extract conversation text with speaker labels from transcript."""
+    fmt = detect_transcript_format(data)
+    lines = []
+
+    if fmt == "assemblyai":
+        for u in data.get("utterances", []):
+            speaker = u.get("speaker", "?")
+            text = u.get("text", "")
+            if text:
+                lines.append(f"[{speaker}]: {text}")
+    elif fmt == "speechmatics":
+        # Group words into utterances by speaker
+        current_speaker = None
+        current_text = []
+        for r in data.get("results", []):
+            speaker = None
+            word = ""
+            for alt in r.get("alternatives", []):
+                if alt.get("speaker"):
+                    speaker = alt["speaker"]
+                if alt.get("content"):
+                    word = alt["content"]
+            if r.get("speaker"):
+                speaker = r["speaker"]
+
+            if speaker and speaker != current_speaker:
+                if current_speaker and current_text:
+                    lines.append(f"[{current_speaker}]: {' '.join(current_text)}")
+                current_speaker = speaker
+                current_text = []
+
+            if word:
+                current_text.append(word)
+
+        if current_speaker and current_text:
+            lines.append(f"[{current_speaker}]: {' '.join(current_text)}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# LLM Provider Interface
+# =============================================================================
+
+@dataclass
+class LLMResponse:
+    """Response from LLM provider."""
+    content: str
+    model: str
+    provider: str
+    usage: dict = field(default_factory=dict)
+
+
+class LLMProvider:
+    """Base class for LLM providers."""
+    name: str = "base"
+
+    def is_available(self) -> bool:
+        """Check if provider is available (API key set, etc)."""
+        raise NotImplementedError
+
+    def generate(self, prompt: str, model: Optional[str] = None) -> LLMResponse:
+        """Generate response from LLM."""
+        raise NotImplementedError
+
+
+class AnthropicProvider(LLMProvider):
+    """Anthropic Claude provider."""
+    name = "anthropic"
+
+    def __init__(self):
+        self.api_key = os.environ.get(ENV_VARS["anthropic"])
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
+
+    def generate(self, prompt: str, model: Optional[str] = None) -> LLMResponse:
+        from anthropic import Anthropic
+
+        client = Anthropic(api_key=self.api_key)
+        model = model or DEFAULT_MODELS["anthropic"]
+
+        message = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        return LLMResponse(
+            content=message.content[0].text,
+            model=model,
+            provider="anthropic",
+            usage={
+                "input_tokens": message.usage.input_tokens,
+                "output_tokens": message.usage.output_tokens,
+            }
+        )
+
+
+class OpenAIProvider(LLMProvider):
+    """OpenAI GPT provider."""
+    name = "openai"
+
+    def __init__(self):
+        self.api_key = os.environ.get(ENV_VARS["openai"])
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
+
+    def generate(self, prompt: str, model: Optional[str] = None) -> LLMResponse:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=self.api_key)
+        model = model or DEFAULT_MODELS["openai"]
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2048,
+        )
+
+        return LLMResponse(
+            content=response.choices[0].message.content,
+            model=model,
+            provider="openai",
+            usage={
+                "input_tokens": response.usage.prompt_tokens if response.usage else 0,
+                "output_tokens": response.usage.completion_tokens if response.usage else 0,
+            }
+        )
+
+
+class OllamaProvider(LLMProvider):
+    """Ollama local provider."""
+    name = "ollama"
+
+    def __init__(self):
+        self.host = os.environ.get(ENV_VARS["ollama"], DEFAULT_OLLAMA_HOST)
+
+    def is_available(self) -> bool:
+        """Check if Ollama server is reachable."""
+        import requests
+        try:
+            response = requests.get(f"{self.host}/api/tags", timeout=2)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def generate(self, prompt: str, model: Optional[str] = None) -> LLMResponse:
+        import requests
+
+        model = model or DEFAULT_MODELS["ollama"]
+        url = f"{self.host}/api/generate"
+
+        response = requests.post(
+            url,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        return LLMResponse(
+            content=data.get("response", ""),
+            model=model,
+            provider="ollama",
+            usage={
+                "total_duration": data.get("total_duration", 0),
+                "eval_count": data.get("eval_count", 0),
+            }
+        )
+
+
+def get_available_provider() -> Optional[LLMProvider]:
+    """Get the first available LLM provider (in priority order)."""
+    providers = [
+        AnthropicProvider(),
+        OpenAIProvider(),
+        OllamaProvider(),
+    ]
+
+    for provider in providers:
+        if provider.is_available():
+            return provider
+
+    return None
+
+
+def get_provider_by_name(name: str) -> Optional[LLMProvider]:
+    """Get a specific provider by name."""
+    providers = {
+        "anthropic": AnthropicProvider,
+        "openai": OpenAIProvider,
+        "ollama": OllamaProvider,
+    }
+
+    if name in providers:
+        return providers[name]()
+    return None
+
+
+# =============================================================================
+# Speaker Detection Logic
+# =============================================================================
+
+@dataclass
+class SpeakerDetection:
+    """Detection result for a speaker."""
+    speaker_label: str
+    detected_name: Optional[str]
+    confidence: float
+    evidence: list[str] = field(default_factory=list)
+
+
+def build_analysis_prompt(conversation_text: str, speaker_labels: list[str]) -> str:
+    """Build the LLM prompt for speaker name analysis."""
+    return f"""Analyze this conversation transcript and identify the names of the speakers.
+
+SPEAKERS TO IDENTIFY: {', '.join(speaker_labels)}
+
+DETECTION PATTERNS TO LOOK FOR:
+{DETECTION_PATTERNS}
+
+CONVERSATION:
+{conversation_text}
+
+INSTRUCTIONS:
+1. For each speaker label, determine if their name is mentioned or can be inferred
+2. Provide confidence (0.0-1.0) based on evidence strength
+3. List specific quotes that support your identification
+
+Respond in JSON format:
+{{
+    "detections": [
+        {{
+            "speaker_label": "S1",
+            "detected_name": "Alice" or null,
+            "confidence": 0.85,
+            "evidence": ["Quote 1 that reveals name", "Quote 2..."]
+        }}
+    ],
+    "notes": "Any additional observations"
+}}
+
+Only respond with the JSON, no other text."""
+
+
+def build_quick_prompt(conversation_text: str, speaker_labels: list[str]) -> str:
+    """Build a simpler prompt for quick name detection."""
+    return f"""From this conversation, identify the names of speakers {', '.join(speaker_labels)}.
+
+CONVERSATION:
+{conversation_text}
+
+Respond ONLY with JSON:
+{{
+    "names": {{
+        "S1": "Alice" or null,
+        "S2": "Bob" or null
+    }}
+}}"""
+
+
+def parse_llm_response(response_text: str) -> dict:
+    """Parse JSON from LLM response, handling markdown code blocks."""
+    text = response_text.strip()
+
+    # Remove markdown code blocks if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```json) and last line (```)
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+
+    # Find JSON start
+    json_start = -1
+    for i, c in enumerate(text):
+        if c == '{':
+            json_start = i
+            break
+
+    if json_start >= 0:
+        return json.loads(text[json_start:])
+
+    return json.loads(text)
+
+
+def analyze_transcript(
+    transcript_data: dict,
+    provider: LLMProvider,
+    model: Optional[str] = None,
+    use_cache: bool = True,
+) -> dict:
+    """Perform full speaker name analysis on transcript."""
+    conversation_text = extract_conversation_text(transcript_data)
+    speaker_labels = get_speakers_from_transcript(transcript_data)
+
+    if not speaker_labels:
+        return {
+            "detections": [],
+            "model": model or DEFAULT_MODELS.get(provider.name, "unknown"),
+            "processed_at": utc_now_iso(),
+            "error": "No speakers found in transcript",
+        }
+
+    # Check cache
+    if use_cache:
+        cache_key = compute_transcript_hash(conversation_text)
+        cache_file = get_cache_dir() / f"{cache_key}.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    cached = json.load(f)
+                    cached["cached"] = True
+                    return cached
+            except (json.JSONDecodeError, IOError):
+                pass
+
+    # Build prompt and call LLM
+    prompt = build_analysis_prompt(conversation_text, speaker_labels)
+
+    try:
+        response = provider.generate(prompt, model)
+        parsed = parse_llm_response(response.content)
+    except Exception as e:
+        return {
+            "detections": [],
+            "model": model or DEFAULT_MODELS.get(provider.name, "unknown"),
+            "processed_at": utc_now_iso(),
+            "error": str(e),
+        }
+
+    result = {
+        "detections": parsed.get("detections", []),
+        "model": response.model,
+        "provider": response.provider,
+        "processed_at": utc_now_iso(),
+        "usage": response.usage,
+    }
+
+    if "notes" in parsed:
+        result["notes"] = parsed["notes"]
+
+    # Save to cache
+    if use_cache:
+        cache_key = compute_transcript_hash(conversation_text)
+        cache_file = get_cache_dir() / f"{cache_key}.json"
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(result, f, indent=2)
+        except IOError:
+            pass
+
+    return result
+
+
+def detect_names_quick(
+    transcript_data: dict,
+    provider: LLMProvider,
+    model: Optional[str] = None,
+    use_cache: bool = True,
+) -> dict:
+    """Quick name detection mode - returns just speaker to name mapping."""
+    conversation_text = extract_conversation_text(transcript_data)
+    speaker_labels = get_speakers_from_transcript(transcript_data)
+
+    if not speaker_labels:
+        return {
+            "names": {},
+            "model": model or DEFAULT_MODELS.get(provider.name, "unknown"),
+            "processed_at": utc_now_iso(),
+        }
+
+    # Check cache
+    if use_cache:
+        cache_key = compute_transcript_hash(conversation_text + "_quick")
+        cache_file = get_cache_dir() / f"{cache_key}.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    cached = json.load(f)
+                    cached["cached"] = True
+                    return cached
+            except (json.JSONDecodeError, IOError):
+                pass
+
+    # Build prompt and call LLM
+    prompt = build_quick_prompt(conversation_text, speaker_labels)
+
+    try:
+        response = provider.generate(prompt, model)
+        parsed = parse_llm_response(response.content)
+    except Exception as e:
+        return {
+            "names": {},
+            "model": model or DEFAULT_MODELS.get(provider.name, "unknown"),
+            "processed_at": utc_now_iso(),
+            "error": str(e),
+        }
+
+    result = {
+        "names": parsed.get("names", {}),
+        "model": response.model,
+        "provider": response.provider,
+        "processed_at": utc_now_iso(),
+    }
+
+    # Save to cache
+    if use_cache:
+        cache_key = compute_transcript_hash(conversation_text + "_quick")
+        cache_file = get_cache_dir() / f"{cache_key}.json"
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(result, f, indent=2)
+        except IOError:
+            pass
+
+    return result
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Perform full speaker name analysis."""
+    transcript_path = Path(args.transcript).resolve()
+
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    # Load transcript
+    try:
+        with open(transcript_path) as f:
+            transcript_data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in transcript: {e}", file=sys.stderr)
+        return 1
+
+    # Get provider
+    if args.provider:
+        provider = get_provider_by_name(args.provider)
+        if not provider:
+            print(f"Error: Unknown provider: {args.provider}", file=sys.stderr)
+            return 1
+        if not provider.is_available():
+            print(f"Error: Provider '{args.provider}' not available. Check API key or server.", file=sys.stderr)
+            return 1
+    else:
+        provider = get_available_provider()
+        if not provider:
+            print("Error: No LLM provider available.", file=sys.stderr)
+            print("Set one of:", file=sys.stderr)
+            print(f"  - {ENV_VARS['anthropic']} for Claude", file=sys.stderr)
+            print(f"  - {ENV_VARS['openai']} for GPT", file=sys.stderr)
+            print(f"  - {ENV_VARS['ollama']} for Ollama (or start Ollama server)", file=sys.stderr)
+            return 1
+
+    if not args.quiet:
+        print(f"Using provider: {provider.name}", file=sys.stderr)
+
+    # Perform analysis
+    result = analyze_transcript(
+        transcript_data,
+        provider,
+        model=args.model,
+        use_cache=not args.no_cache,
+    )
+
+    # Add context if provided
+    if args.context:
+        result["context"] = args.context
+
+    # Output
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        # Human-readable format
+        print(f"\nSpeaker Name Detection Results")
+        print("=" * 40)
+        print(f"Provider: {result.get('provider', 'unknown')}")
+        print(f"Model: {result.get('model', 'unknown')}")
+        print(f"Processed: {result.get('processed_at', '-')}")
+        if result.get("cached"):
+            print("(from cache)")
+        print()
+
+        if result.get("error"):
+            print(f"Error: {result['error']}")
+            return 1
+
+        detections = result.get("detections", [])
+        if detections:
+            print("Detections:")
+            for d in detections:
+                label = d.get("speaker_label", "?")
+                name = d.get("detected_name") or "(not detected)"
+                conf = d.get("confidence", 0)
+                print(f"  {label} -> {name} (confidence: {conf:.2f})")
+                if d.get("evidence") and args.verbose:
+                    for e in d["evidence"][:3]:
+                        print(f"       - \"{e}\"")
+        else:
+            print("No speaker names detected")
+
+        if result.get("notes"):
+            print(f"\nNotes: {result['notes']}")
+
+    return 0
+
+
+def cmd_detect_names(args: argparse.Namespace) -> int:
+    """Quick name detection mode."""
+    transcript_path = Path(args.transcript).resolve()
+
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    # Load transcript
+    try:
+        with open(transcript_path) as f:
+            transcript_data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in transcript: {e}", file=sys.stderr)
+        return 1
+
+    # Get provider
+    if args.provider:
+        provider = get_provider_by_name(args.provider)
+        if not provider:
+            print(f"Error: Unknown provider: {args.provider}", file=sys.stderr)
+            return 1
+        if not provider.is_available():
+            print(f"Error: Provider '{args.provider}' not available.", file=sys.stderr)
+            return 1
+    else:
+        provider = get_available_provider()
+        if not provider:
+            print("Error: No LLM provider available.", file=sys.stderr)
+            return 1
+
+    # Perform detection
+    result = detect_names_quick(
+        transcript_data,
+        provider,
+        model=args.model,
+        use_cache=not args.no_cache,
+    )
+
+    # Output
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        names = result.get("names", {})
+        if names:
+            for label, name in names.items():
+                print(f"{label}: {name or '-'}")
+        else:
+            print("No names detected")
+
+    return 0
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    """Show available LLM providers."""
+    providers = [
+        ("anthropic", AnthropicProvider()),
+        ("openai", OpenAIProvider()),
+        ("ollama", OllamaProvider()),
+    ]
+
+    print("LLM Providers:")
+    print("=" * 40)
+
+    for name, provider in providers:
+        available = provider.is_available()
+        status = "available" if available else "not configured"
+        env_var = ENV_VARS.get(name, "?")
+        default_model = DEFAULT_MODELS.get(name, "?")
+
+        print(f"\n{name}:")
+        print(f"  Status: {status}")
+        print(f"  Env var: {env_var}")
+        print(f"  Default model: {default_model}")
+
+        if name == "ollama":
+            host = os.environ.get(ENV_VARS["ollama"], DEFAULT_OLLAMA_HOST)
+            print(f"  Host: {host}")
+
+    print("\n" + "=" * 40)
+    auto_provider = get_available_provider()
+    if auto_provider:
+        print(f"Auto-selected provider: {auto_provider.name}")
+    else:
+        print("No provider available. Configure one of the above.")
+
+    return 0
+
+
+def cmd_clear_cache(args: argparse.Namespace) -> int:
+    """Clear the LLM response cache."""
+    cache_dir = get_cache_dir()
+
+    if not cache_dir.exists():
+        print("Cache directory does not exist")
+        return 0
+
+    cache_files = list(cache_dir.glob("*.json"))
+
+    if not cache_files:
+        print("Cache is empty")
+        return 0
+
+    if not args.force:
+        print(f"Clear {len(cache_files)} cached responses?")
+        response = input("Confirm [y/N]: ")
+        if response.lower() != "y":
+            print("Cancelled")
+            return 0
+
+    for f in cache_files:
+        f.unlink()
+
+    print(f"Cleared {len(cache_files)} cached responses")
+    return 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="LLM-based speaker name detection from transcripts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"speaker-llm {VERSION}")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress non-essential output")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # analyze command
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="Full speaker name analysis with evidence"
+    )
+    analyze_parser.add_argument("transcript", help="Path to transcript JSON file")
+    analyze_parser.add_argument("--provider", "-p", choices=["anthropic", "openai", "ollama"],
+                               help="LLM provider (auto-detect if not specified)")
+    analyze_parser.add_argument("--model", "-m", help="Model to use (provider default if not specified)")
+    analyze_parser.add_argument("--context", "-c", help="Context name for the conversation")
+    analyze_parser.add_argument("--format", "-f", choices=["text", "json"], default="json",
+                               help="Output format (default: json)")
+    analyze_parser.add_argument("--no-cache", action="store_true", help="Bypass response cache")
+    analyze_parser.set_defaults(func=cmd_analyze)
+
+    # detect-names command
+    detect_parser = subparsers.add_parser(
+        "detect-names",
+        help="Quick name detection mode"
+    )
+    detect_parser.add_argument("transcript", help="Path to transcript JSON file")
+    detect_parser.add_argument("--provider", "-p", choices=["anthropic", "openai", "ollama"],
+                              help="LLM provider")
+    detect_parser.add_argument("--model", "-m", help="Model to use")
+    detect_parser.add_argument("--format", "-f", choices=["text", "json"], default="json",
+                              help="Output format")
+    detect_parser.add_argument("--no-cache", action="store_true", help="Bypass response cache")
+    detect_parser.set_defaults(func=cmd_detect_names)
+
+    # providers command
+    providers_parser = subparsers.add_parser(
+        "providers",
+        help="Show available LLM providers"
+    )
+    providers_parser.set_defaults(func=cmd_providers)
+
+    # clear-cache command
+    cache_parser = subparsers.add_parser(
+        "clear-cache",
+        help="Clear the LLM response cache"
+    )
+    cache_parser.add_argument("--force", "-f", action="store_true", help="Skip confirmation")
+    cache_parser.set_defaults(func=cmd_clear_cache)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

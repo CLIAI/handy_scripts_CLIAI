@@ -1,0 +1,751 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pyyaml>=6.0",
+# ]
+# ///
+"""
+speaker-catalog - Recording inventory and processing state management
+
+Track recordings, their processing state, transcripts, and review progress.
+Part of the speaker-* tool ecosystem.
+
+Usage:
+    speaker-catalog add <audio> [--context NAME] [--tags TAG,...]
+    speaker-catalog list [--status STATUS] [--context NAME] [--needs-review]
+    speaker-catalog show <audio>
+    speaker-catalog status <audio>
+    speaker-catalog register-transcript <audio> --backend NAME --transcript FILE
+    speaker-catalog set-context <audio> --context NAME [--expected-speakers ID,...]
+    speaker-catalog remove <audio> [--force]
+    speaker-catalog query '<jq-expression>'
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+# Optional YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+
+# =============================================================================
+# Constants and Configuration
+# =============================================================================
+
+VERSION = "1.0.0"
+SCHEMA_VERSION = 1
+
+# Status values in order of progression
+STATUS_VALUES = ["unprocessed", "transcribed", "assigned", "reviewed", "complete"]
+
+
+def get_speakers_embeddings_dir() -> Path:
+    """Get the root directory for speaker embeddings storage."""
+    return Path(os.environ.get(
+        "SPEAKERS_EMBEDDINGS_DIR",
+        os.path.expanduser("~/.config/speakers_embeddings")
+    ))
+
+
+def get_catalog_dir() -> Path:
+    """Get the catalog directory."""
+    catalog_dir = get_speakers_embeddings_dir() / "catalog"
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    return catalog_dir
+
+
+def get_assignments_dir() -> Path:
+    """Get the assignments directory."""
+    assignments_dir = get_speakers_embeddings_dir() / "assignments"
+    assignments_dir.mkdir(parents=True, exist_ok=True)
+    return assignments_dir
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def compute_b3sum(file_path: Path) -> str:
+    """Compute Blake3 hash of a file, falling back to SHA256 if b3sum unavailable."""
+    try:
+        result = subprocess.run(
+            ["b3sum", "--no-names", str(file_path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()[:32]  # First 32 chars (128 bits)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to SHA256
+        import hashlib
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()[:32]
+
+
+def get_audio_duration(file_path: Path) -> Optional[float]:
+    """Get audio duration in seconds using ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(file_path)
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
+
+
+def utc_now_iso() -> str:
+    """Return current UTC time in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_yaml(path: Path) -> dict:
+    """Load YAML file, with JSON fallback."""
+    with open(path, "r") as f:
+        content = f.read()
+    if YAML_AVAILABLE:
+        return yaml.safe_load(content) or {}
+    else:
+        # Try JSON as fallback
+        return json.loads(content)
+
+
+def save_yaml(path: Path, data: dict) -> None:
+    """Save data as YAML, with JSON fallback."""
+    with open(path, "w") as f:
+        if YAML_AVAILABLE:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        else:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def resolve_audio_path(audio_arg: str) -> Path:
+    """Resolve audio argument to a Path, handling b3sum prefix lookups."""
+    # Check if it looks like a b3sum prefix (hex, 6-32 chars)
+    if len(audio_arg) >= 6 and len(audio_arg) <= 32 and all(c in "0123456789abcdef" for c in audio_arg.lower()):
+        # Try to find matching catalog entry
+        catalog_dir = get_catalog_dir()
+        matches = list(catalog_dir.glob(f"{audio_arg.lower()}*.yaml"))
+        if len(matches) == 1:
+            entry = load_yaml(matches[0])
+            return Path(entry.get("recording", {}).get("path", ""))
+        elif len(matches) > 1:
+            print(f"Error: Ambiguous b3sum prefix '{audio_arg}' matches {len(matches)} entries", file=sys.stderr)
+            sys.exit(1)
+
+    # Treat as file path
+    return Path(audio_arg).resolve()
+
+
+def get_catalog_entry_path(b3sum: str) -> Path:
+    """Get path to catalog entry file."""
+    return get_catalog_dir() / f"{b3sum}.yaml"
+
+
+def load_catalog_entry(audio_path: Path) -> Optional[dict]:
+    """Load catalog entry for an audio file."""
+    b3sum = compute_b3sum(audio_path)
+    entry_path = get_catalog_entry_path(b3sum)
+    if entry_path.exists():
+        return load_yaml(entry_path)
+    return None
+
+
+def find_catalog_entry_by_path(audio_path: Path) -> Optional[tuple[str, dict]]:
+    """Find catalog entry by path, returns (b3sum, entry) or None."""
+    resolved_path = str(audio_path.resolve())
+    catalog_dir = get_catalog_dir()
+
+    for entry_file in catalog_dir.glob("*.yaml"):
+        entry = load_yaml(entry_file)
+        entry_path = entry.get("recording", {}).get("path", "")
+        if entry_path == resolved_path:
+            return entry_file.stem, entry
+
+    return None
+
+
+# =============================================================================
+# Status Computation
+# =============================================================================
+
+def compute_status(entry: dict) -> str:
+    """Compute the current status of a catalog entry."""
+    # Check if has transcripts
+    transcriptions = entry.get("transcriptions", [])
+    if not transcriptions:
+        return "unprocessed"
+
+    # Check if has assignments
+    b3sum = entry.get("recording", {}).get("b3sum", "")
+    assignments_path = get_assignments_dir() / f"{b3sum}.yaml"
+    if not assignments_path.exists():
+        return "transcribed"
+
+    # Check review status
+    review = entry.get("review", {})
+    review_status = review.get("status", "none")
+
+    if review_status == "complete":
+        return "complete"
+    elif review_status == "partial":
+        return "reviewed"
+    else:
+        return "assigned"
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_add(args: argparse.Namespace) -> int:
+    """Add a recording to the catalog."""
+    audio_path = Path(args.audio).resolve()
+
+    if not audio_path.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    # Compute b3sum
+    b3sum = compute_b3sum(audio_path)
+    entry_path = get_catalog_entry_path(b3sum)
+
+    # Check if already exists
+    if entry_path.exists() and not args.force:
+        print(f"Error: Recording already in catalog (b3sum: {b3sum})", file=sys.stderr)
+        print(f"Use --force to update existing entry", file=sys.stderr)
+        return 1
+
+    # Get audio duration
+    duration = get_audio_duration(audio_path)
+
+    # Build catalog entry
+    entry = {
+        "schema_version": SCHEMA_VERSION,
+        "recording": {
+            "path": str(audio_path),
+            "b3sum": b3sum,
+            "duration_sec": duration,
+            "discovered_at": utc_now_iso(),
+        },
+        "context": {
+            "name": args.context or None,
+            "expected_speakers": [],
+            "tags": args.tags.split(",") if args.tags else [],
+        },
+        "transcriptions": [],
+        "status": "unprocessed",
+        "updated_at": utc_now_iso(),
+    }
+
+    # Save entry
+    save_yaml(entry_path, entry)
+
+    if not args.quiet:
+        print(f"Added: {audio_path.name}")
+        print(f"  b3sum: {b3sum}")
+        if duration:
+            print(f"  duration: {duration:.1f}s")
+        if args.context:
+            print(f"  context: {args.context}")
+
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List recordings in the catalog."""
+    catalog_dir = get_catalog_dir()
+    entries = []
+
+    for entry_file in sorted(catalog_dir.glob("*.yaml")):
+        entry = load_yaml(entry_file)
+        b3sum = entry_file.stem
+
+        # Compute current status
+        status = compute_status(entry)
+
+        # Apply filters
+        if args.status and status != args.status:
+            continue
+
+        context_name = entry.get("context", {}).get("name")
+        if args.context and context_name != args.context:
+            continue
+
+        if args.needs_review:
+            if status in ["complete", "unprocessed"]:
+                continue
+
+        entries.append({
+            "b3sum": b3sum,
+            "path": entry.get("recording", {}).get("path", ""),
+            "status": status,
+            "context": context_name,
+            "transcriptions": len(entry.get("transcriptions", [])),
+            "duration_sec": entry.get("recording", {}).get("duration_sec"),
+        })
+
+    # Apply pagination
+    if args.offset:
+        entries = entries[args.offset:]
+    if args.limit:
+        entries = entries[:args.limit]
+
+    # Output
+    if args.format == "json":
+        print(json.dumps(entries, indent=2, ensure_ascii=False))
+    elif args.format == "ids":
+        for e in entries:
+            print(e["b3sum"])
+    elif args.format == "paths":
+        for e in entries:
+            print(e["path"])
+    else:
+        # Table format
+        if not entries:
+            print("No recordings in catalog")
+            return 0
+
+        # Calculate column widths
+        b3sum_width = 8
+        status_width = max(len("Status"), max(len(e["status"]) for e in entries))
+        ctx_width = max(len("Context"), max(len(e["context"] or "-") for e in entries))
+
+        # Header
+        print(f"{'B3SUM':<{b3sum_width}}  {'Status':<{status_width}}  {'Context':<{ctx_width}}  {'Trans':>5}  Path")
+        print("-" * (b3sum_width + status_width + ctx_width + 40))
+
+        for e in entries:
+            path_display = Path(e["path"]).name if e["path"] else "-"
+            ctx_display = e["context"] or "-"
+            print(f"{e['b3sum'][:b3sum_width]:<{b3sum_width}}  {e['status']:<{status_width}}  {ctx_display:<{ctx_width}}  {e['transcriptions']:>5}  {path_display}")
+
+        print(f"\nTotal: {len(entries)} recording(s)")
+
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """Show detailed information about a recording."""
+    audio_path = resolve_audio_path(args.audio)
+
+    # Try to find by b3sum first
+    if len(args.audio) >= 6 and len(args.audio) <= 32:
+        catalog_dir = get_catalog_dir()
+        matches = list(catalog_dir.glob(f"{args.audio.lower()}*.yaml"))
+        if len(matches) == 1:
+            entry = load_yaml(matches[0])
+            b3sum = matches[0].stem
+        elif len(matches) > 1:
+            print(f"Error: Ambiguous b3sum prefix '{args.audio}'", file=sys.stderr)
+            return 1
+        else:
+            entry = None
+    else:
+        entry = load_catalog_entry(audio_path)
+        b3sum = compute_b3sum(audio_path) if audio_path.exists() else None
+
+    if not entry:
+        print(f"Error: Recording not in catalog: {args.audio}", file=sys.stderr)
+        return 1
+
+    # Compute current status
+    entry["status"] = compute_status(entry)
+
+    if args.format == "json":
+        print(json.dumps(entry, indent=2, ensure_ascii=False))
+    elif args.format == "yaml":
+        if YAML_AVAILABLE:
+            print(yaml.dump(entry, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        else:
+            print(json.dumps(entry, indent=2, ensure_ascii=False))
+    else:
+        # Human-readable format
+        rec = entry.get("recording", {})
+        ctx = entry.get("context", {})
+
+        print(f"Recording: {Path(rec.get('path', '')).name}")
+        print(f"  Path: {rec.get('path', '-')}")
+        print(f"  B3SUM: {rec.get('b3sum', '-')}")
+        if rec.get("duration_sec"):
+            mins = int(rec["duration_sec"] // 60)
+            secs = int(rec["duration_sec"] % 60)
+            print(f"  Duration: {mins}m {secs}s ({rec['duration_sec']:.1f}s)")
+        print(f"  Status: {entry.get('status', '-')}")
+
+        print(f"\nContext:")
+        print(f"  Name: {ctx.get('name') or '-'}")
+        if ctx.get("expected_speakers"):
+            print(f"  Expected speakers: {', '.join(ctx['expected_speakers'])}")
+        if ctx.get("tags"):
+            print(f"  Tags: {', '.join(ctx['tags'])}")
+
+        transcriptions = entry.get("transcriptions", [])
+        if transcriptions:
+            print(f"\nTranscriptions ({len(transcriptions)}):")
+            for t in transcriptions:
+                print(f"  - {t.get('backend', '-')}: {t.get('transcript_path', '-')}")
+                print(f"    Processed: {t.get('processed_at', '-')}")
+                if t.get("speakers_detected"):
+                    print(f"    Speakers: {t['speakers_detected']}")
+        else:
+            print(f"\nTranscriptions: none")
+
+        print(f"\nUpdated: {entry.get('updated_at', '-')}")
+
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show brief status of a recording."""
+    audio_path = resolve_audio_path(args.audio)
+
+    # Try to find by b3sum first
+    if len(args.audio) >= 6 and len(args.audio) <= 32:
+        catalog_dir = get_catalog_dir()
+        matches = list(catalog_dir.glob(f"{args.audio.lower()}*.yaml"))
+        if len(matches) == 1:
+            entry = load_yaml(matches[0])
+        else:
+            entry = None
+    else:
+        entry = load_catalog_entry(audio_path)
+
+    if not entry:
+        print(f"Error: Recording not in catalog: {args.audio}", file=sys.stderr)
+        return 1
+
+    status = compute_status(entry)
+
+    if args.format == "json":
+        print(json.dumps({"status": status}))
+    else:
+        print(status)
+
+    return 0
+
+
+def cmd_register_transcript(args: argparse.Namespace) -> int:
+    """Register a transcript for a recording."""
+    audio_path = resolve_audio_path(args.audio)
+    transcript_path = Path(args.transcript).resolve()
+
+    if not transcript_path.exists():
+        print(f"Error: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return 1
+
+    # Find or create catalog entry
+    b3sum = compute_b3sum(audio_path) if audio_path.exists() else None
+
+    # Try to find existing entry
+    if b3sum:
+        entry_path = get_catalog_entry_path(b3sum)
+        if entry_path.exists():
+            entry = load_yaml(entry_path)
+        else:
+            print(f"Error: Recording not in catalog. Use 'speaker-catalog add' first.", file=sys.stderr)
+            return 1
+    else:
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    # Load transcript to detect format and speaker count
+    with open(transcript_path, "r") as f:
+        transcript_data = json.load(f)
+
+    # Detect format and count speakers
+    speakers_detected = 0
+    if "utterances" in transcript_data:
+        # AssemblyAI format
+        speakers = set(u.get("speaker") for u in transcript_data["utterances"] if u.get("speaker"))
+        speakers_detected = len(speakers)
+    elif "results" in transcript_data:
+        # Speechmatics format
+        speakers = set()
+        for r in transcript_data["results"]:
+            for alt in r.get("alternatives", []):
+                if alt.get("speaker"):
+                    speakers.add(alt["speaker"])
+        speakers_detected = len(speakers)
+
+    # Add transcript entry
+    transcript_entry = {
+        "backend": args.backend,
+        "version": args.version or f"{args.backend}-v1",
+        "transcript_path": str(transcript_path),
+        "processed_at": utc_now_iso(),
+        "tool_version": args.tool_version or "unknown",
+        "speakers_detected": speakers_detected,
+    }
+
+    # Check if already registered
+    transcriptions = entry.get("transcriptions", [])
+    for i, t in enumerate(transcriptions):
+        if t.get("backend") == args.backend:
+            if not args.force:
+                print(f"Error: Transcript for backend '{args.backend}' already registered", file=sys.stderr)
+                print(f"Use --force to replace", file=sys.stderr)
+                return 1
+            transcriptions[i] = transcript_entry
+            break
+    else:
+        transcriptions.append(transcript_entry)
+
+    entry["transcriptions"] = transcriptions
+    entry["status"] = compute_status(entry)
+    entry["updated_at"] = utc_now_iso()
+
+    save_yaml(entry_path, entry)
+
+    if not args.quiet:
+        print(f"Registered transcript: {transcript_path.name}")
+        print(f"  Backend: {args.backend}")
+        print(f"  Speakers detected: {speakers_detected}")
+
+    return 0
+
+
+def cmd_set_context(args: argparse.Namespace) -> int:
+    """Set context for a recording."""
+    audio_path = resolve_audio_path(args.audio)
+
+    # Find catalog entry
+    b3sum = compute_b3sum(audio_path) if audio_path.exists() else None
+    if not b3sum:
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        return 1
+
+    entry_path = get_catalog_entry_path(b3sum)
+    if not entry_path.exists():
+        print(f"Error: Recording not in catalog", file=sys.stderr)
+        return 1
+
+    entry = load_yaml(entry_path)
+
+    # Update context
+    if "context" not in entry:
+        entry["context"] = {}
+
+    if args.context:
+        entry["context"]["name"] = args.context
+
+    if args.expected_speakers:
+        entry["context"]["expected_speakers"] = args.expected_speakers.split(",")
+
+    if args.tags:
+        existing_tags = entry["context"].get("tags", [])
+        new_tags = args.tags.split(",")
+        entry["context"]["tags"] = list(set(existing_tags + new_tags))
+
+    if args.remove_tags:
+        existing_tags = entry["context"].get("tags", [])
+        remove_tags = args.remove_tags.split(",")
+        entry["context"]["tags"] = [t for t in existing_tags if t not in remove_tags]
+
+    entry["updated_at"] = utc_now_iso()
+
+    save_yaml(entry_path, entry)
+
+    if not args.quiet:
+        print(f"Updated context for: {audio_path.name}")
+        if args.context:
+            print(f"  Context: {args.context}")
+        if args.expected_speakers:
+            print(f"  Expected speakers: {args.expected_speakers}")
+
+    return 0
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    """Remove a recording from the catalog."""
+    audio_path = resolve_audio_path(args.audio)
+
+    # Find catalog entry
+    b3sum = compute_b3sum(audio_path) if audio_path.exists() else None
+
+    # Also try as b3sum prefix
+    if not b3sum or not get_catalog_entry_path(b3sum).exists():
+        if len(args.audio) >= 6:
+            catalog_dir = get_catalog_dir()
+            matches = list(catalog_dir.glob(f"{args.audio.lower()}*.yaml"))
+            if len(matches) == 1:
+                b3sum = matches[0].stem
+            elif len(matches) > 1:
+                print(f"Error: Ambiguous b3sum prefix", file=sys.stderr)
+                return 1
+
+    if not b3sum:
+        print(f"Error: Recording not in catalog: {args.audio}", file=sys.stderr)
+        return 1
+
+    entry_path = get_catalog_entry_path(b3sum)
+    if not entry_path.exists():
+        print(f"Error: Recording not in catalog", file=sys.stderr)
+        return 1
+
+    # Confirm removal
+    if not args.force:
+        entry = load_yaml(entry_path)
+        rec_path = entry.get("recording", {}).get("path", "")
+        print(f"Remove from catalog: {Path(rec_path).name}?")
+        print(f"  B3SUM: {b3sum}")
+        response = input("Confirm [y/N]: ")
+        if response.lower() != "y":
+            print("Cancelled")
+            return 0
+
+    # Remove entry
+    entry_path.unlink()
+
+    # Also remove assignments if they exist
+    assignments_path = get_assignments_dir() / f"{b3sum}.yaml"
+    if assignments_path.exists():
+        assignments_path.unlink()
+        if not args.quiet:
+            print("Also removed associated assignments")
+
+    if not args.quiet:
+        print(f"Removed: {b3sum}")
+
+    return 0
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    """Query catalog entries with jq expression."""
+    # Check if jq is available
+    try:
+        subprocess.run(["jq", "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: jq is required for query command", file=sys.stderr)
+        return 1
+
+    # Collect all entries
+    catalog_dir = get_catalog_dir()
+    entries = []
+
+    for entry_file in sorted(catalog_dir.glob("*.yaml")):
+        entry = load_yaml(entry_file)
+        entry["_b3sum"] = entry_file.stem
+        entry["status"] = compute_status(entry)
+        entries.append(entry)
+
+    # Run jq
+    try:
+        result = subprocess.run(
+            ["jq", args.expression],
+            input=json.dumps(entries),
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(result.stdout, end="")
+    except subprocess.CalledProcessError as e:
+        print(f"jq error: {e.stderr}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Recording inventory and processing state management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"speaker-catalog {VERSION}")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress non-essential output")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # add command
+    add_parser = subparsers.add_parser("add", help="Add a recording to the catalog")
+    add_parser.add_argument("audio", help="Path to audio file")
+    add_parser.add_argument("--context", "-c", help="Context name (e.g., 'team-standup')")
+    add_parser.add_argument("--tags", "-t", help="Comma-separated tags")
+    add_parser.add_argument("--force", "-f", action="store_true", help="Overwrite if exists")
+    add_parser.set_defaults(func=cmd_add)
+
+    # list command
+    list_parser = subparsers.add_parser("list", help="List recordings in the catalog")
+    list_parser.add_argument("--status", "-s", choices=STATUS_VALUES, help="Filter by status")
+    list_parser.add_argument("--context", "-c", help="Filter by context name")
+    list_parser.add_argument("--needs-review", "-r", action="store_true", help="Show only recordings needing review")
+    list_parser.add_argument("--format", "-f", choices=["table", "json", "ids", "paths"], default="table")
+    list_parser.add_argument("--limit", type=int, help="Maximum results to show")
+    list_parser.add_argument("--offset", type=int, default=0, help="Skip first N results")
+    list_parser.set_defaults(func=cmd_list)
+
+    # show command
+    show_parser = subparsers.add_parser("show", help="Show detailed info about a recording")
+    show_parser.add_argument("audio", help="Path to audio file or b3sum prefix")
+    show_parser.add_argument("--format", "-f", choices=["text", "json", "yaml"], default="text")
+    show_parser.set_defaults(func=cmd_show)
+
+    # status command
+    status_parser = subparsers.add_parser("status", help="Show status of a recording")
+    status_parser.add_argument("audio", help="Path to audio file or b3sum prefix")
+    status_parser.add_argument("--format", "-f", choices=["text", "json"], default="text")
+    status_parser.set_defaults(func=cmd_status)
+
+    # register-transcript command
+    register_parser = subparsers.add_parser("register-transcript", help="Register a transcript for a recording")
+    register_parser.add_argument("audio", help="Path to audio file")
+    register_parser.add_argument("--backend", "-b", required=True, help="Transcription backend (e.g., speechmatics, assemblyai)")
+    register_parser.add_argument("--transcript", "-t", required=True, help="Path to transcript JSON file")
+    register_parser.add_argument("--version", help="Backend version string")
+    register_parser.add_argument("--tool-version", help="Tool version that created transcript")
+    register_parser.add_argument("--force", "-f", action="store_true", help="Replace existing transcript for backend")
+    register_parser.set_defaults(func=cmd_register_transcript)
+
+    # set-context command
+    context_parser = subparsers.add_parser("set-context", help="Set context for a recording")
+    context_parser.add_argument("audio", help="Path to audio file")
+    context_parser.add_argument("--context", "-c", help="Context name")
+    context_parser.add_argument("--expected-speakers", "-e", help="Comma-separated expected speaker IDs")
+    context_parser.add_argument("--tags", "-t", help="Comma-separated tags to add")
+    context_parser.add_argument("--remove-tags", help="Comma-separated tags to remove")
+    context_parser.set_defaults(func=cmd_set_context)
+
+    # remove command
+    remove_parser = subparsers.add_parser("remove", help="Remove a recording from the catalog")
+    remove_parser.add_argument("audio", help="Path to audio file or b3sum prefix")
+    remove_parser.add_argument("--force", "-f", action="store_true", help="Skip confirmation")
+    remove_parser.set_defaults(func=cmd_remove)
+
+    # query command
+    query_parser = subparsers.add_parser("query", help="Query catalog with jq expression")
+    query_parser.add_argument("expression", help="jq expression to run on catalog entries")
+    query_parser.set_defaults(func=cmd_query)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

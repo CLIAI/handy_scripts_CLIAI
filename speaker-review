@@ -1,0 +1,998 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pyyaml>=6.0",
+#     "rich>=13.0",
+# ]
+# ///
+"""
+speaker-review - Interactive TUI for reviewing speaker assignments and samples
+
+Review diarization assignments, approve/reject samples, and grow the embeddings database.
+
+Usage:
+    speaker-review [<audio>]           # Review specific recording
+    speaker-review --continue          # Continue previous session
+    speaker-review --context NAME      # Review all in context
+    speaker-review --speaker ID        # Review samples for specific speaker
+
+Keybindings during review:
+    a = approve (extract sample, add to database)
+    r = reject (mark incorrect)
+    s = skip (defer decision)
+    e = edit speaker profile
+    p = play audio segment
+    n = next sample
+    N = previous sample
+    ? = help
+    q = quit (save progress)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+# Rich for TUI
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Prompt, Confirm
+    from rich.table import Table
+    from rich.text import Text
+    from rich import print as rprint
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+# Optional YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+
+# =============================================================================
+# Constants and Configuration
+# =============================================================================
+
+VERSION = "1.0.0"
+
+HELP_TEXT = """
+Speaker Review - Keybindings
+============================
+a = approve    Mark assignment correct, extract sample
+r = reject     Mark as incorrect
+s = skip       Defer decision for later
+e = edit       Edit speaker profile (names, tags)
+p = play       Play audio segment
+n = next       Go to next segment
+N = previous   Go to previous segment
+c = context    Set/confirm context
+? = help       Show this help
+q = quit       Save progress and exit
+"""
+
+
+def get_speakers_embeddings_dir() -> Path:
+    """Get the root directory for speaker embeddings storage."""
+    return Path(os.environ.get(
+        "SPEAKERS_EMBEDDINGS_DIR",
+        os.path.expanduser("~/.config/speakers_embeddings")
+    ))
+
+
+def get_cache_dir() -> Path:
+    """Get cache directory for session state."""
+    cache_dir = Path(os.environ.get(
+        "XDG_CACHE_HOME",
+        os.path.expanduser("~/.cache")
+    )) / "speaker-review"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_assignments_dir() -> Path:
+    """Get the assignments directory."""
+    return get_speakers_embeddings_dir() / "assignments"
+
+
+def get_catalog_dir() -> Path:
+    """Get the catalog directory."""
+    return get_speakers_embeddings_dir() / "catalog"
+
+
+def get_db_dir() -> Path:
+    """Get the speaker profiles directory."""
+    return get_speakers_embeddings_dir() / "db"
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def compute_b3sum(file_path: Path) -> str:
+    """Compute Blake3 hash of a file, falling back to SHA256 if b3sum unavailable."""
+    try:
+        result = subprocess.run(
+            ["b3sum", "--no-names", str(file_path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()[:32]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        import hashlib
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()[:32]
+
+
+def utc_now_iso() -> str:
+    """Return current UTC time in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_yaml(path: Path) -> dict:
+    """Load YAML file, with JSON fallback."""
+    with open(path, "r") as f:
+        content = f.read()
+    if YAML_AVAILABLE:
+        return yaml.safe_load(content) or {}
+    else:
+        return json.loads(content)
+
+
+def save_yaml(path: Path, data: dict) -> None:
+    """Save data as YAML, with JSON fallback."""
+    with open(path, "w") as f:
+        if YAML_AVAILABLE:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        else:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def resolve_audio_b3sum(audio_arg: str) -> Optional[str]:
+    """Resolve audio argument to b3sum."""
+    if len(audio_arg) >= 6 and len(audio_arg) <= 32 and all(c in "0123456789abcdef" for c in audio_arg.lower()):
+        catalog_dir = get_catalog_dir()
+        matches = list(catalog_dir.glob(f"{audio_arg.lower()}*.yaml"))
+        if len(matches) == 1:
+            return matches[0].stem
+
+    audio_path = Path(audio_arg).resolve()
+    if audio_path.exists():
+        return compute_b3sum(audio_path)
+    return None
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds as MM:SS."""
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class Segment:
+    """A speaker segment to review."""
+    index: int
+    speaker_label: str
+    speaker_id: Optional[str]
+    confidence: str
+    start: float
+    end: float
+    text: str
+    signals: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ReviewDecision:
+    """A review decision for a segment."""
+    action: str  # approve, reject, skip
+    speaker_id: Optional[str] = None
+    notes: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@dataclass
+class ReviewSession:
+    """State of a review session."""
+    recording_b3sum: str
+    audio_path: str
+    transcript_path: str
+    context: Optional[str]
+    segments: list[Segment]
+    current_index: int = 0
+    decisions: dict[int, ReviewDecision] = field(default_factory=dict)
+    started_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+# =============================================================================
+# Session Management
+# =============================================================================
+
+def get_session_path() -> Path:
+    """Get path to session state file."""
+    return get_cache_dir() / "session.yaml"
+
+
+def save_session(session: ReviewSession) -> None:
+    """Save session state to disk."""
+    session.updated_at = utc_now_iso()
+    data = {
+        "recording_b3sum": session.recording_b3sum,
+        "audio_path": session.audio_path,
+        "transcript_path": session.transcript_path,
+        "context": session.context,
+        "current_index": session.current_index,
+        "decisions": {
+            k: {
+                "action": v.action,
+                "speaker_id": v.speaker_id,
+                "notes": v.notes,
+                "timestamp": v.timestamp,
+            }
+            for k, v in session.decisions.items()
+        },
+        "started_at": session.started_at,
+        "updated_at": session.updated_at,
+    }
+    save_yaml(get_session_path(), data)
+
+
+def load_session() -> Optional[ReviewSession]:
+    """Load session state from disk."""
+    session_path = get_session_path()
+    if not session_path.exists():
+        return None
+
+    data = load_yaml(session_path)
+
+    # Rebuild segments from assignments
+    b3sum = data.get("recording_b3sum")
+    if not b3sum:
+        return None
+
+    assignments_path = get_assignments_dir() / f"{b3sum}.yaml"
+    if not assignments_path.exists():
+        return None
+
+    segments = load_segments_from_assignments(assignments_path, data.get("transcript_path", ""))
+
+    decisions = {
+        int(k): ReviewDecision(
+            action=v.get("action", "skip"),
+            speaker_id=v.get("speaker_id"),
+            notes=v.get("notes"),
+            timestamp=v.get("timestamp"),
+        )
+        for k, v in data.get("decisions", {}).items()
+    }
+
+    return ReviewSession(
+        recording_b3sum=b3sum,
+        audio_path=data.get("audio_path", ""),
+        transcript_path=data.get("transcript_path", ""),
+        context=data.get("context"),
+        segments=segments,
+        current_index=data.get("current_index", 0),
+        decisions=decisions,
+        started_at=data.get("started_at"),
+        updated_at=data.get("updated_at"),
+    )
+
+
+def clear_session() -> None:
+    """Clear saved session."""
+    session_path = get_session_path()
+    if session_path.exists():
+        session_path.unlink()
+
+
+# =============================================================================
+# Segment Loading
+# =============================================================================
+
+def load_segments_from_assignments(assignments_path: Path, transcript_path: str) -> list[Segment]:
+    """Load segments from assignment file and transcript."""
+    assignments = load_yaml(assignments_path)
+    mappings = assignments.get("mappings", {})
+
+    # Load transcript for text
+    segments = []
+    idx = 0
+
+    if transcript_path and Path(transcript_path).exists():
+        with open(transcript_path, "r") as f:
+            transcript_data = json.load(f)
+
+        # Get segments from transcript
+        if "utterances" in transcript_data:
+            # AssemblyAI format
+            for u in transcript_data["utterances"]:
+                label = u.get("speaker", "")
+                mapping = mappings.get(label, {})
+                segments.append(Segment(
+                    index=idx,
+                    speaker_label=label,
+                    speaker_id=mapping.get("speaker_id"),
+                    confidence=mapping.get("confidence", "unassigned"),
+                    start=u.get("start", 0) / 1000.0,
+                    end=u.get("end", 0) / 1000.0,
+                    text=u.get("text", ""),
+                    signals=mapping.get("signals", []),
+                ))
+                idx += 1
+        elif "results" in transcript_data:
+            # Speechmatics - group by speaker changes
+            current_speaker = None
+            current_segment = None
+
+            for r in transcript_data["results"]:
+                speaker = None
+                text = ""
+                for alt in r.get("alternatives", []):
+                    speaker = alt.get("speaker", speaker)
+                    text = alt.get("content", text)
+
+                if r.get("speaker"):
+                    speaker = r["speaker"]
+
+                if speaker and speaker != current_speaker:
+                    if current_segment:
+                        segments.append(current_segment)
+                        idx += 1
+                    mapping = mappings.get(speaker, {})
+                    current_segment = Segment(
+                        index=idx,
+                        speaker_label=speaker,
+                        speaker_id=mapping.get("speaker_id"),
+                        confidence=mapping.get("confidence", "unassigned"),
+                        start=r.get("start_time", 0),
+                        end=r.get("end_time", 0),
+                        text=text,
+                        signals=mapping.get("signals", []),
+                    )
+                    current_speaker = speaker
+                elif current_segment and r.get("end_time"):
+                    current_segment.end = r["end_time"]
+                    if text:
+                        current_segment.text += " " + text
+
+            if current_segment:
+                segments.append(current_segment)
+    else:
+        # No transcript, create segments from mappings only
+        for label, mapping in mappings.items():
+            segments.append(Segment(
+                index=idx,
+                speaker_label=label,
+                speaker_id=mapping.get("speaker_id"),
+                confidence=mapping.get("confidence", "unassigned"),
+                start=0,
+                end=0,
+                text="(no transcript available)",
+                signals=mapping.get("signals", []),
+            ))
+            idx += 1
+
+    return segments
+
+
+# =============================================================================
+# Audio Playback
+# =============================================================================
+
+def play_audio_segment(audio_path: str, start: float, end: float) -> bool:
+    """Play audio segment using mpv or ffplay."""
+    if not Path(audio_path).exists():
+        return False
+
+    # Try mpv first
+    try:
+        subprocess.run(
+            [
+                "mpv",
+                "--no-video",
+                "--really-quiet",
+                f"--start={start}",
+                f"--end={end}",
+                audio_path,
+            ],
+            check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # Try ffplay
+    try:
+        subprocess.run(
+            [
+                "ffplay",
+                "-nodisp",
+                "-autoexit",
+                "-ss", str(start),
+                "-t", str(end - start),
+                audio_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    return False
+
+
+# =============================================================================
+# TUI Rendering
+# =============================================================================
+
+def render_segment(console: Console, session: ReviewSession) -> None:
+    """Render current segment for review."""
+    if not session.segments:
+        console.print("[red]No segments to review[/red]")
+        return
+
+    idx = session.current_index
+    if idx >= len(session.segments):
+        idx = len(session.segments) - 1
+        session.current_index = idx
+
+    segment = session.segments[idx]
+
+    # Build status line
+    reviewed = len(session.decisions)
+    total = len(session.segments)
+    progress = f"[{idx + 1}/{total}]"
+    reviewed_text = f"Reviewed: {reviewed}/{total}"
+
+    # Confidence color
+    conf_colors = {
+        "confirmed": "green",
+        "high": "green",
+        "medium": "yellow",
+        "low": "red",
+        "unassigned": "dim",
+    }
+    conf_color = conf_colors.get(segment.confidence, "white")
+
+    # Speaker display
+    speaker_display = segment.speaker_id or "(unassigned)"
+    if segment.speaker_id:
+        speaker_display = f"[bold]{speaker_display}[/bold]"
+
+    # Check if already reviewed
+    decision = session.decisions.get(idx)
+    decision_text = ""
+    if decision:
+        if decision.action == "approve":
+            decision_text = "[green] APPROVED[/green]"
+        elif decision.action == "reject":
+            decision_text = "[red] REJECTED[/red]"
+        elif decision.action == "skip":
+            decision_text = "[dim] SKIPPED[/dim]"
+
+    # Build panel content
+    content = Text()
+    content.append(f"Speaker Label: ", style="dim")
+    content.append(f"{segment.speaker_label}\n", style="bold")
+    content.append(f"Assigned To:   ", style="dim")
+    content.append(f"{speaker_display}", style=f"{conf_color}")
+    content.append(f" ({segment.confidence}){decision_text}\n")
+    content.append(f"Time:          ", style="dim")
+    content.append(f"{format_time(segment.start)} - {format_time(segment.end)}\n")
+    content.append(f"\n")
+    content.append(f'"{segment.text[:200]}{"..." if len(segment.text) > 200 else ""}"\n', style="italic")
+
+    # Signals
+    if segment.signals:
+        content.append(f"\nSignals:\n", style="dim")
+        for sig in segment.signals[:3]:
+            sig_type = sig.get("type", "?")
+            sig_score = sig.get("score", 0)
+            content.append(f"  - {sig_type}: {sig_score:.2f}\n", style="dim")
+
+    # Context
+    if session.context:
+        content.append(f"\nContext: {session.context}", style="dim")
+
+    console.print(Panel(
+        content,
+        title=f"{progress} {reviewed_text}",
+        subtitle="[a]pprove [r]eject [s]kip [p]lay [n]ext [N]prev [?]help [q]uit",
+    ))
+
+
+def render_help(console: Console) -> None:
+    """Render help panel."""
+    console.print(Panel(HELP_TEXT, title="Help"))
+
+
+def render_summary(console: Console, session: ReviewSession) -> None:
+    """Render session summary."""
+    approved = sum(1 for d in session.decisions.values() if d.action == "approve")
+    rejected = sum(1 for d in session.decisions.values() if d.action == "reject")
+    skipped = sum(1 for d in session.decisions.values() if d.action == "skip")
+    total = len(session.segments)
+    remaining = total - len(session.decisions)
+
+    table = Table(title="Review Summary")
+    table.add_column("Status", style="bold")
+    table.add_column("Count", justify="right")
+    table.add_row("[green]Approved[/green]", str(approved))
+    table.add_row("[red]Rejected[/red]", str(rejected))
+    table.add_row("[dim]Skipped[/dim]", str(skipped))
+    table.add_row("Remaining", str(remaining))
+    table.add_row("[bold]Total[/bold]", str(total))
+
+    console.print(table)
+
+
+# =============================================================================
+# Actions
+# =============================================================================
+
+def action_approve(session: ReviewSession, console: Console) -> None:
+    """Approve current segment."""
+    segment = session.segments[session.current_index]
+
+    # Confirm speaker ID
+    speaker_id = segment.speaker_id
+    if not speaker_id:
+        speaker_id = Prompt.ask("Enter speaker ID to assign", default="")
+        if not speaker_id:
+            console.print("[yellow]Cancelled - no speaker ID provided[/yellow]")
+            return
+
+    session.decisions[session.current_index] = ReviewDecision(
+        action="approve",
+        speaker_id=speaker_id,
+        timestamp=utc_now_iso(),
+    )
+
+    # Call speaker_samples extract if available
+    try:
+        if segment.start > 0 and segment.end > segment.start and Path(session.audio_path).exists():
+            result = subprocess.run(
+                [
+                    "speaker_samples", "extract",
+                    session.audio_path,
+                    "-t", session.transcript_path,
+                    "-l", segment.speaker_label,
+                    "-s", speaker_id,
+                    "--max-segments", "1",
+                    "-q",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]Approved and extracted sample for {speaker_id}[/green]")
+            else:
+                console.print(f"[green]Approved[/green] (sample extraction skipped)")
+        else:
+            console.print(f"[green]Approved: {speaker_id}[/green]")
+    except FileNotFoundError:
+        console.print(f"[green]Approved: {speaker_id}[/green] (speaker_samples not available)")
+
+    save_session(session)
+
+
+def action_reject(session: ReviewSession, console: Console) -> None:
+    """Reject current segment."""
+    segment = session.segments[session.current_index]
+    notes = Prompt.ask("Rejection notes (optional)", default="")
+
+    session.decisions[session.current_index] = ReviewDecision(
+        action="reject",
+        notes=notes if notes else None,
+        timestamp=utc_now_iso(),
+    )
+
+    console.print(f"[red]Rejected: {segment.speaker_label}[/red]")
+    save_session(session)
+
+
+def action_skip(session: ReviewSession, console: Console) -> None:
+    """Skip current segment."""
+    session.decisions[session.current_index] = ReviewDecision(
+        action="skip",
+        timestamp=utc_now_iso(),
+    )
+    console.print("[dim]Skipped[/dim]")
+    save_session(session)
+
+
+def action_play(session: ReviewSession, console: Console) -> None:
+    """Play current segment audio."""
+    segment = session.segments[session.current_index]
+
+    if segment.start >= segment.end:
+        console.print("[yellow]No audio timing available[/yellow]")
+        return
+
+    console.print(f"[dim]Playing {format_time(segment.start)} - {format_time(segment.end)}...[/dim]")
+
+    if not play_audio_segment(session.audio_path, segment.start, segment.end):
+        console.print("[red]Could not play audio (mpv/ffplay not found)[/red]")
+
+
+def action_edit(session: ReviewSession, console: Console) -> None:
+    """Edit speaker profile."""
+    segment = session.segments[session.current_index]
+
+    if not segment.speaker_id:
+        console.print("[yellow]No speaker assigned to edit[/yellow]")
+        return
+
+    # Try to call speaker_detection update
+    try:
+        new_name = Prompt.ask(f"New display name for {segment.speaker_id}", default="")
+        if new_name:
+            result = subprocess.run(
+                [
+                    "speaker_detection", "update",
+                    segment.speaker_id,
+                    "--name", new_name,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                console.print(f"[green]Updated {segment.speaker_id}[/green]")
+            else:
+                console.print(f"[red]Failed to update: {result.stderr}[/red]")
+    except FileNotFoundError:
+        console.print("[yellow]speaker_detection not available[/yellow]")
+
+
+def action_context(session: ReviewSession, console: Console) -> None:
+    """Set or confirm context."""
+    current = session.context or "(none)"
+    new_context = Prompt.ask(f"Context name", default=current)
+    session.context = new_context if new_context != "(none)" else None
+    console.print(f"Context set to: {session.context or '(none)'}")
+    save_session(session)
+
+
+# =============================================================================
+# Main Review Loop
+# =============================================================================
+
+def review_loop(session: ReviewSession, console: Console) -> None:
+    """Main interactive review loop."""
+    import sys
+    import tty
+    import termios
+
+    def getch():
+        """Get a single character from stdin."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+    while True:
+        console.clear()
+        render_segment(console, session)
+
+        # Get key
+        console.print("\n[dim]Press a key...[/dim]", end="")
+        key = getch()
+        console.print()
+
+        if key == 'q':
+            save_session(session)
+            render_summary(console, session)
+            break
+        elif key == 'a':
+            action_approve(session, console)
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 'r':
+            action_reject(session, console)
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 's':
+            action_skip(session, console)
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 'p':
+            action_play(session, console)
+            input("\nPress Enter to continue...")
+        elif key == 'e':
+            action_edit(session, console)
+            input("\nPress Enter to continue...")
+        elif key == 'c':
+            action_context(session, console)
+            input("\nPress Enter to continue...")
+        elif key == 'n':
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 'N':
+            if session.current_index > 0:
+                session.current_index -= 1
+        elif key == '?':
+            render_help(console)
+            input("\nPress Enter to continue...")
+
+
+def review_loop_simple(session: ReviewSession, console: Console) -> None:
+    """Simplified review loop using input() instead of raw terminal."""
+    while True:
+        console.print("\n" + "=" * 60)
+        render_segment(console, session)
+
+        key = Prompt.ask(
+            "\n[a]pprove [r]eject [s]kip [p]lay [n]ext [N]prev [?]help [q]uit",
+            default="n"
+        ).lower()
+
+        if key == 'q':
+            save_session(session)
+            render_summary(console, session)
+            break
+        elif key == 'a':
+            action_approve(session, console)
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 'r':
+            action_reject(session, console)
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 's':
+            action_skip(session, console)
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key == 'p':
+            action_play(session, console)
+        elif key == 'e':
+            action_edit(session, console)
+        elif key == 'c':
+            action_context(session, console)
+        elif key == 'n' or key == '':
+            if session.current_index < len(session.segments) - 1:
+                session.current_index += 1
+        elif key.upper() == 'N' or key == 'prev':
+            if session.current_index > 0:
+                session.current_index -= 1
+        elif key == '?':
+            render_help(console)
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """Start or continue a review session."""
+    if not RICH_AVAILABLE:
+        print("Error: rich library required for TUI. Install with: pip install rich", file=sys.stderr)
+        return 1
+
+    console = Console()
+
+    # Continue existing session
+    if args.continue_session:
+        session = load_session()
+        if not session:
+            console.print("[red]No saved session found[/red]")
+            return 1
+        console.print(f"[green]Resuming session for: {session.recording_b3sum[:8]}...[/green]")
+    elif args.audio:
+        # Start new session for specific audio
+        b3sum = resolve_audio_b3sum(args.audio)
+        if not b3sum:
+            console.print(f"[red]Could not resolve audio: {args.audio}[/red]")
+            return 1
+
+        assignments_path = get_assignments_dir() / f"{b3sum}.yaml"
+        if not assignments_path.exists():
+            console.print(f"[red]No assignments found. Run speaker-assign first.[/red]")
+            return 1
+
+        assignments = load_yaml(assignments_path)
+        transcript_path = assignments.get("transcript_path", "")
+
+        # Get audio path from catalog
+        catalog_path = get_catalog_dir() / f"{b3sum}.yaml"
+        audio_path = ""
+        context = args.context
+        if catalog_path.exists():
+            catalog = load_yaml(catalog_path)
+            audio_path = catalog.get("recording", {}).get("path", "")
+            if not context:
+                context = catalog.get("context", {}).get("name")
+
+        segments = load_segments_from_assignments(assignments_path, transcript_path)
+
+        session = ReviewSession(
+            recording_b3sum=b3sum,
+            audio_path=audio_path,
+            transcript_path=transcript_path,
+            context=context,
+            segments=segments,
+            started_at=utc_now_iso(),
+        )
+    else:
+        # Find next recording needing review
+        assignments_dir = get_assignments_dir()
+        if not assignments_dir.exists():
+            console.print("[yellow]No assignments found. Run speaker-assign first.[/yellow]")
+            return 1
+
+        for assignment_file in sorted(assignments_dir.glob("*.yaml")):
+            b3sum = assignment_file.stem
+            # TODO: Check if already fully reviewed
+            assignments = load_yaml(assignment_file)
+            transcript_path = assignments.get("transcript_path", "")
+
+            catalog_path = get_catalog_dir() / f"{b3sum}.yaml"
+            audio_path = ""
+            context = args.context
+            if catalog_path.exists():
+                catalog = load_yaml(catalog_path)
+                audio_path = catalog.get("recording", {}).get("path", "")
+                if not context:
+                    context = catalog.get("context", {}).get("name")
+
+            segments = load_segments_from_assignments(assignment_file, transcript_path)
+
+            session = ReviewSession(
+                recording_b3sum=b3sum,
+                audio_path=audio_path,
+                transcript_path=transcript_path,
+                context=context,
+                segments=segments,
+                started_at=utc_now_iso(),
+            )
+            break
+        else:
+            console.print("[green]All recordings reviewed![/green]")
+            return 0
+
+    if not session.segments:
+        console.print("[yellow]No segments to review[/yellow]")
+        return 0
+
+    console.print(f"[bold]Reviewing: {Path(session.audio_path).name if session.audio_path else session.recording_b3sum[:8]}...[/bold]")
+    console.print(f"Segments: {len(session.segments)}")
+
+    # Use simple loop (works in all terminals)
+    if args.simple or not sys.stdin.isatty():
+        review_loop_simple(session, console)
+    else:
+        try:
+            review_loop(session, console)
+        except Exception:
+            # Fallback to simple mode
+            review_loop_simple(session, console)
+
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show current session status."""
+    if not RICH_AVAILABLE:
+        print("Error: rich library required. Install with: pip install rich", file=sys.stderr)
+        return 1
+
+    console = Console()
+    session = load_session()
+
+    if not session:
+        console.print("[yellow]No active session[/yellow]")
+        return 0
+
+    console.print(f"[bold]Active Session[/bold]")
+    console.print(f"Recording: {session.recording_b3sum[:8]}...")
+    if session.audio_path:
+        console.print(f"Audio: {Path(session.audio_path).name}")
+    console.print(f"Context: {session.context or '-'}")
+    console.print(f"Progress: {session.current_index + 1}/{len(session.segments)}")
+    console.print(f"Reviewed: {len(session.decisions)}/{len(session.segments)}")
+
+    if session.decisions:
+        approved = sum(1 for d in session.decisions.values() if d.action == "approve")
+        rejected = sum(1 for d in session.decisions.values() if d.action == "reject")
+        skipped = sum(1 for d in session.decisions.values() if d.action == "skip")
+        console.print(f"  Approved: {approved}, Rejected: {rejected}, Skipped: {skipped}")
+
+    return 0
+
+
+def cmd_clear(args: argparse.Namespace) -> int:
+    """Clear saved session."""
+    clear_session()
+    print("Session cleared")
+    return 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Interactive TUI for reviewing speaker assignments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_TEXT,
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"speaker-review {VERSION}")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # review command (default)
+    review_parser = subparsers.add_parser("review", help="Start or continue review session")
+    review_parser.add_argument("audio", nargs="?", help="Path to audio file or b3sum prefix")
+    review_parser.add_argument("--continue", "-c", dest="continue_session", action="store_true", help="Continue previous session")
+    review_parser.add_argument("--context", help="Filter by context")
+    review_parser.add_argument("--speaker", help="Review samples for specific speaker")
+    review_parser.add_argument("--simple", "-s", action="store_true", help="Use simple prompt mode (no raw terminal)")
+    review_parser.set_defaults(func=cmd_review)
+
+    # status command
+    status_parser = subparsers.add_parser("status", help="Show session status")
+    status_parser.set_defaults(func=cmd_status)
+
+    # clear command
+    clear_parser = subparsers.add_parser("clear", help="Clear saved session")
+    clear_parser.set_defaults(func=cmd_clear)
+
+    args = parser.parse_args()
+
+    # Default to review if no subcommand
+    if not args.command:
+        # Check for positional args in sys.argv
+        if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+            args.audio = sys.argv[1]
+            args.continue_session = False
+            args.context = None
+            args.speaker = None
+            args.simple = False
+            args.func = cmd_review
+        elif "--continue" in sys.argv or "-c" in sys.argv:
+            args.audio = None
+            args.continue_session = True
+            args.context = None
+            args.speaker = None
+            args.simple = False
+            args.func = cmd_review
+        else:
+            args.audio = None
+            args.continue_session = False
+            args.context = None
+            args.speaker = None
+            args.simple = False
+            args.func = cmd_review
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
