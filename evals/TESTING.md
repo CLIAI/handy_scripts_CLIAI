@@ -9,6 +9,46 @@ This document describes the testing methodology for speaker detection and STT to
 3. **Docker-first** - All tests runnable in containers for CI/CD
 4. **End-to-end coverage** - From audio generation to speaker identification
 
+## Test Collections
+
+The speaker-* tool ecosystem uses a unified test runner. Each collection has dedicated documentation.
+
+### Running Tests
+
+```bash
+./run_speaker_diarization_tests.sh              # Run all tests
+./run_speaker_diarization_tests.sh unit         # Fast unit tests (no API)
+./run_speaker_diarization_tests.sh catalog      # Specific collection
+./run_speaker_diarization_tests.sh --doc catalog  # View collection docs
+```
+
+### Collection Overview
+
+| Collection | Tests | Tool/Module | Documentation |
+|------------|-------|-------------|---------------|
+| `catalog` | 23 | speaker-catalog | [test_speaker_catalog.README.md](speaker_detection/test_speaker_catalog.README.md) |
+| `assign` | 24 | speaker-assign | [test_speaker_assign.README.md](speaker_detection/test_speaker_assign.README.md) |
+| `review` | 18 | speaker-review | [test_speaker_review.README.md](speaker_detection/test_speaker_review.README.md) |
+| `llm` | 23 | speaker-llm | [test_speaker_llm.README.md](speaker_detection/test_speaker_llm.README.md) |
+| `process` | 22 | speaker-process | [test_speaker_process.README.md](speaker_detection/test_speaker_process.README.md) |
+| `report` | 26 | speaker-report | [test_speaker_report.README.md](speaker_detection/test_speaker_report.README.md) |
+| `segments` | 8 | speaker_segments | [test_speaker_segments.README.md](speaker_detection/test_speaker_segments.README.md) |
+| `profiles` | 10 | audio_profiles | [test_audio_profiles.README.md](speaker_detection/test_audio_profiles.README.md) |
+| `legacy` | 27 | speaker_detection CLI | [test_legacy.README.md](speaker_detection/test_legacy.README.md) |
+| `e2e` | 17 | Pipeline integration | [test_e2e_pipeline.README.md](speaker_detection/test_e2e_pipeline.README.md) |
+| `unit` | 181 | All unit tests | [test_unit.README.md](speaker_detection/test_unit.README.md) |
+| `all` | 198 | Complete suite | [run_speaker_diarization_tests.sh.README.md](../run_speaker_diarization_tests.sh.README.md) |
+
+### Test Runner Documentation
+
+For complete test runner documentation:
+
+```bash
+./run_speaker_diarization_tests.sh --doc all
+```
+
+Or see [run_speaker_diarization_tests.sh.README.md](../run_speaker_diarization_tests.sh.README.md).
+
 ## Environment Variable Pattern
 
 **Every script MUST check environment variables before using defaults:**
