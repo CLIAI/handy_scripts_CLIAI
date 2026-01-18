@@ -1,6 +1,0 @@
-# Generated audio files
-/audio/*.wav
-/audio/*.ogg
-
-# Test results
-/results/
