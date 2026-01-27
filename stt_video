@@ -1,0 +1,383 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""
+stt_video - Unified Speech-to-Text Wrapper
+
+A wrapper script that provides a unified interface for transcribing video/audio
+files using different STT backends (Speechmatics, OpenAI, AssemblyAI).
+
+Supports both local files and URLs. For URLs, automatically downloads audio
+using yt-dlp-priv.py (preferred) or falls back to yt-dlp, youtube-dl, or
+curl/wget for direct media URLs.
+
+Usage:
+    stt_video [options] <file_or_url> [-- backend_args...]
+
+Examples:
+    # Transcribe local file with default backend (speechmatics)
+    stt_video video.mp4
+
+    # Transcribe YouTube video with OpenAI backend
+    stt_video -b openai "https://youtube.com/watch?v=xyz"
+
+    # Transcribe with speaker diarization
+    stt_video -s 3 -l de video.mp4
+
+    # Pass additional arguments to backend
+    stt_video video.mp4 -- --operating-point enhanced
+
+Environment Variables:
+    STT_VIDEO_BACKEND: Default backend (speechmatics, openai, assemblyai)
+                       Default: speechmatics
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# Supported backends and their script names
+BACKENDS = {
+    "speechmatics": "stt_video_using_speechmatics.sh",
+    "openai": "stt_video_using_openai.sh",
+    "assemblyai": "stt_video_using_assemblyai.sh",
+}
+
+# Media file extensions for direct download detection
+MEDIA_EXTENSIONS = {
+    ".mp3", ".mp4", ".m4a", ".wav", ".webm", ".ogg", ".flac",
+    ".aac", ".mkv", ".avi", ".mov", ".wmv", ".opus",
+}
+
+
+def is_url(path: str) -> bool:
+    """Check if the input is a URL."""
+    return path.startswith("http://") or path.startswith("https://")
+
+
+def is_direct_media_url(url: str) -> bool:
+    """Check if URL points directly to a media file."""
+    # Remove query parameters for extension check
+    path = url.split("?")[0].split("#")[0]
+    return any(path.lower().endswith(ext) for ext in MEDIA_EXTENSIONS)
+
+
+def find_download_tool() -> tuple[list[str], str] | None:
+    """
+    Find the best available download tool.
+
+    Returns:
+        Tuple of (command_list, tool_name) or None if no tool found.
+    """
+    # Priority 1: yt-dlp-priv.py with --audio flag
+    if shutil.which("yt-dlp-priv.py"):
+        return (["yt-dlp-priv.py", "--audio"], "yt-dlp-priv.py")
+
+    # Priority 2: yt-dlp
+    if shutil.which("yt-dlp"):
+        return (["yt-dlp", "-x", "--audio-format", "mp3"], "yt-dlp")
+
+    # Priority 3: youtube-dl
+    if shutil.which("youtube-dl"):
+        return (["youtube-dl", "-x", "--audio-format", "mp3"], "youtube-dl")
+
+    return None
+
+
+def find_direct_download_tool() -> tuple[str, list[str]] | None:
+    """
+    Find tool for direct media URL download.
+
+    Returns:
+        Tuple of (tool_name, base_command) or None if no tool found.
+    """
+    if shutil.which("aria2c"):
+        return ("aria2c", ["aria2c"])
+    if shutil.which("curl"):
+        return ("curl", ["curl", "-L", "-o"])
+    if shutil.which("wget"):
+        return ("wget", ["wget", "-O"])
+    return None
+
+
+def download_from_url(url: str, output_dir: str | None = None) -> str | None:
+    """
+    Download audio from URL using best available tool.
+
+    Args:
+        url: URL to download from
+        output_dir: Optional output directory (overrides default)
+
+    Returns:
+        Path to downloaded file or None on failure.
+    """
+    # Try video platform downloaders first
+    download_tool = find_download_tool()
+
+    if download_tool:
+        cmd, tool_name = download_tool
+        print(f"> Downloading audio using {tool_name}...", file=sys.stderr)
+
+        full_cmd = cmd.copy()
+
+        # Add output directory if specified
+        if output_dir and tool_name == "yt-dlp-priv.py":
+            # yt-dlp-priv.py uses its own destination logic by default
+            # We'd need to use environment variables or modify script
+            # For now, let it use default and find the file
+            pass
+
+        full_cmd.append(url)
+
+        try:
+            result = subprocess.run(full_cmd, check=True, capture_output=True, text=True)
+            # Try to extract the output file path from stdout
+            # yt-dlp-priv.py prints destination directory at the end
+            for line in result.stdout.strip().split("\n"):
+                if line and os.path.isdir(line):
+                    # Find the most recent audio file in directory
+                    audio_files = []
+                    for ext in [".mp3", ".m4a", ".opus", ".wav", ".webm"]:
+                        audio_files.extend(Path(line).glob(f"*{ext}"))
+                    if audio_files:
+                        # Return most recently modified
+                        return str(max(audio_files, key=lambda p: p.stat().st_mtime))
+
+            # If we can't find the file, try stderr
+            for line in result.stderr.strip().split("\n"):
+                if line.startswith("> Destination directory:"):
+                    continue
+                if line and os.path.isdir(line):
+                    audio_files = []
+                    for ext in [".mp3", ".m4a", ".opus", ".wav", ".webm"]:
+                        audio_files.extend(Path(line).glob(f"*{ext}"))
+                    if audio_files:
+                        return str(max(audio_files, key=lambda p: p.stat().st_mtime))
+
+            print(f"> WARNING: Download completed but couldn't locate output file", file=sys.stderr)
+            print(f"> Check the download directory manually", file=sys.stderr)
+            return None
+
+        except subprocess.CalledProcessError as e:
+            print(f"> WARNING: {tool_name} failed: {e}", file=sys.stderr)
+            if e.stderr:
+                print(f"> {e.stderr}", file=sys.stderr)
+
+    # Try direct download for media URLs
+    if is_direct_media_url(url):
+        direct_tool = find_direct_download_tool()
+        if direct_tool:
+            tool_name, base_cmd = direct_tool
+            print(f"> Downloading direct media URL using {tool_name}...", file=sys.stderr)
+
+            # Determine output filename
+            filename = url.split("/")[-1].split("?")[0]
+            if output_dir:
+                output_path = os.path.join(output_dir, filename)
+            else:
+                output_path = os.path.join(tempfile.gettempdir(), filename)
+
+            if tool_name == "aria2c":
+                cmd = base_cmd + ["-d", os.path.dirname(output_path), "-o", os.path.basename(output_path), url]
+            else:
+                cmd = base_cmd + [output_path, url]
+
+            try:
+                subprocess.run(cmd, check=True)
+                if os.path.exists(output_path):
+                    return output_path
+            except subprocess.CalledProcessError as e:
+                print(f"> WARNING: {tool_name} failed: {e}", file=sys.stderr)
+
+    print(f"> ERROR: No suitable download tool found for URL", file=sys.stderr)
+    print(f"> Install one of: yt-dlp-priv.py, yt-dlp, youtube-dl, curl, wget, aria2c", file=sys.stderr)
+    return None
+
+
+def find_backend_script(backend: str) -> str | None:
+    """
+    Find the backend script in PATH.
+
+    Args:
+        backend: Backend name (speechmatics, openai, assemblyai)
+
+    Returns:
+        Script name if found, None otherwise.
+    """
+    if backend not in BACKENDS:
+        print(f"> ERROR: Unknown backend '{backend}'", file=sys.stderr)
+        print(f"> Available backends: {', '.join(BACKENDS.keys())}", file=sys.stderr)
+        return None
+
+    script_name = BACKENDS[backend]
+    if shutil.which(script_name):
+        return script_name
+
+    print(f"> ERROR: Backend script not found: {script_name}", file=sys.stderr)
+    print(f"> Ensure it is installed and in your PATH", file=sys.stderr)
+    return None
+
+
+def run_stt(
+    file_path: str,
+    backend: str,
+    language: str | None,
+    speakers: int | None,
+    pass_through_args: list[str],
+) -> int:
+    """
+    Run STT on the given file using the specified backend.
+
+    Args:
+        file_path: Path to audio/video file
+        backend: STT backend name
+        language: Language code (optional)
+        speakers: Number of speakers (optional)
+        pass_through_args: Additional arguments to pass to backend
+
+    Returns:
+        Exit code from backend script.
+    """
+    script = find_backend_script(backend)
+    if not script:
+        return 1
+
+    # Build command
+    cmd = [script, file_path]
+
+    # Add speakers if specified (for backends that support it)
+    if speakers is not None and backend in ("speechmatics", "assemblyai"):
+        cmd.append(str(speakers))
+
+    # Add language if specified
+    if language:
+        if backend == "openai":
+            # OpenAI: language is second positional arg
+            cmd.append(language)
+        elif speakers is not None:
+            # Speechmatics/AssemblyAI: language is third positional arg
+            cmd.append(language)
+        else:
+            # Need to provide speakers placeholder
+            cmd.append("0")  # 0 = auto-detect
+            cmd.append(language)
+
+    # Add pass-through arguments
+    cmd.extend(pass_through_args)
+
+    print(f"> Running {backend} STT on: {file_path}", file=sys.stderr)
+    print(f"> Command: {' '.join(cmd)}", file=sys.stderr)
+
+    try:
+        result = subprocess.run(cmd)
+        return result.returncode
+    except FileNotFoundError:
+        print(f"> ERROR: Script not found: {script}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(f"\n> Interrupted", file=sys.stderr)
+        return 130
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Unified Speech-to-Text wrapper for video/audio files and URLs.",
+        epilog="Arguments after '--' are passed directly to the backend script.",
+    )
+
+    parser.add_argument(
+        "input",
+        help="File path or URL to transcribe",
+    )
+
+    parser.add_argument(
+        "--backend", "-b",
+        choices=list(BACKENDS.keys()),
+        default=os.environ.get("STT_VIDEO_BACKEND", "speechmatics"),
+        help="STT backend to use (default: %(default)s, or STT_VIDEO_BACKEND env var)",
+    )
+
+    parser.add_argument(
+        "--language", "-l",
+        help="Language code (e.g., en, de, fr). Default: en for most backends, auto for openai",
+    )
+
+    parser.add_argument(
+        "--speakers", "-s",
+        type=int,
+        help="Number of speakers for diarization (0=auto, 1=no diarization). "
+             "Only supported by speechmatics and assemblyai.",
+    )
+
+    parser.add_argument(
+        "--output-dir", "-o",
+        help="Output directory for URL downloads (overrides default destination)",
+    )
+
+    # Collect pass-through arguments
+    parser.add_argument(
+        "pass_through",
+        nargs="*",
+        help=argparse.SUPPRESS,
+    )
+
+    # Handle -- separator for pass-through args
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Split at -- separator
+    if "--" in argv:
+        sep_idx = argv.index("--")
+        main_args = argv[:sep_idx]
+        pass_through = argv[sep_idx + 1:]
+    else:
+        main_args = argv
+        pass_through = []
+
+    args = parser.parse_args(main_args)
+    args.pass_through = pass_through
+
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point."""
+    args = parse_args(argv)
+
+    input_path = args.input
+    file_to_transcribe = None
+
+    # Check if input is URL or file
+    if is_url(input_path):
+        print(f"> Input is URL: {input_path}", file=sys.stderr)
+        file_to_transcribe = download_from_url(input_path, args.output_dir)
+        if not file_to_transcribe:
+            print(f"> ERROR: Failed to download audio from URL", file=sys.stderr)
+            return 1
+    else:
+        # Local file
+        if not os.path.exists(input_path):
+            print(f"> ERROR: File not found: {input_path}", file=sys.stderr)
+            return 1
+        file_to_transcribe = input_path
+
+    # Run STT
+    return run_stt(
+        file_path=file_to_transcribe,
+        backend=args.backend,
+        language=args.language,
+        speakers=args.speakers,
+        pass_through_args=args.pass_through,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
