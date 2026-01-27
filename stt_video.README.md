@@ -7,6 +7,7 @@ A unified Speech-to-Text wrapper that provides a single interface for transcribi
 * **Multiple Backends**: Supports Speechmatics, OpenAI, and AssemblyAI
 * **URL Support**: Automatically downloads audio from YouTube and other platforms
 * **Unified Interface**: Common flags for language and speaker diarization
+* **Fire-and-Forget**: Prompts for missing options BEFORE download, so you can start and walk away
 * **Pass-Through Support**: Forward additional arguments to backend scripts
 * **Smart Download Chain**: Falls back through multiple download tools
 
@@ -61,6 +62,27 @@ stt_video [options] <file_or_url> [-- backend_args...]
 | `--speakers` | `-s` | Number of speakers for diarization (0=auto, 1=no diarization) |
 | `--output-dir` | `-o` | Output directory for URL downloads |
 | `--help` | `-h` | Show help message |
+
+### Upfront Prompting (Fire-and-Forget)
+
+If `--speakers` or `--language` are not provided, `stt_video` prompts for them **before** starting any download. This means you can provide all input upfront and walk away while the download and transcription complete.
+
+**Backend-specific prompts:**
+
+| Backend | Speakers Prompt | Language Prompt |
+|---------|-----------------|-----------------|
+| speechmatics | `Max speakers [0] (0==any):` | `Language code [en]:` |
+| assemblyai | `Expected speakers [0] (0==any):` | `Language code [en]:` |
+| openai | *(skipped - no diarization)* | `Language code [auto]:` |
+
+Press Enter to accept the default shown in brackets.
+
+**Skip prompts entirely:**
+
+```bash
+# Provide all values upfront - no prompts at all
+stt_video -s 1 -l en "https://youtube.com/watch?v=xyz"
+```
 
 ### Pass-Through Arguments
 
