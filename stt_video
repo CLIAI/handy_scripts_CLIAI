@@ -228,7 +228,7 @@ def find_backend_script(backend: str) -> str | None:
 def run_stt(
     file_path: str,
     backend: str,
-    language: str | None,
+    language: str,
     speakers: int | None,
     pass_through_args: list[str],
 ) -> int:
@@ -238,8 +238,8 @@ def run_stt(
     Args:
         file_path: Path to audio/video file
         backend: STT backend name
-        language: Language code (optional)
-        speakers: Number of speakers (optional)
+        language: Language code (guaranteed to have value after prompt_for_missing_args)
+        speakers: Number of speakers (guaranteed for speechmatics/assemblyai, None for openai)
         pass_through_args: Additional arguments to pass to backend
 
     Returns:
@@ -249,25 +249,19 @@ def run_stt(
     if not script:
         return 1
 
-    # Build command
+    # Build command with positional args in order expected by backend scripts:
+    # - speechmatics: FILE [SPEAKERS [LANGUAGE]]
+    # - assemblyai: FILE [SPEAKERS [LANGUAGE]]
+    # - openai: FILE [LANGUAGE]
     cmd = [script, file_path]
 
-    # Add speakers if specified (for backends that support it)
-    if speakers is not None and backend in ("speechmatics", "assemblyai"):
+    if backend == "openai":
+        # OpenAI: FILE LANGUAGE (no speakers support)
+        cmd.append(language)
+    else:
+        # Speechmatics/AssemblyAI: FILE SPEAKERS LANGUAGE
         cmd.append(str(speakers))
-
-    # Add language if specified
-    if language:
-        if backend == "openai":
-            # OpenAI: language is second positional arg
-            cmd.append(language)
-        elif speakers is not None:
-            # Speechmatics/AssemblyAI: language is third positional arg
-            cmd.append(language)
-        else:
-            # Need to provide speakers placeholder
-            cmd.append("0")  # 0 = auto-detect
-            cmd.append(language)
+        cmd.append(language)
 
     # Add pass-through arguments
     cmd.extend(pass_through_args)
@@ -284,6 +278,56 @@ def run_stt(
     except KeyboardInterrupt:
         print(f"\n> Interrupted", file=sys.stderr)
         return 130
+
+
+def prompt_for_missing_args(args: argparse.Namespace) -> None:
+    """
+    Prompt user for missing speakers/language BEFORE download.
+    This ensures all required input is collected upfront so the user
+    can start the command and walk away.
+
+    Modifies args in place.
+    """
+    backend = args.backend
+
+    # Prompt for speakers if not provided and backend supports diarization
+    if args.speakers is None and backend in ("speechmatics", "assemblyai"):
+        if backend == "speechmatics":
+            # Prompt taken from stt_video_using_speechmatics.sh
+            # Please check that script for consistency if prompts change
+            prompt = "Max speakers [0] (0==any):"
+        else:  # assemblyai
+            # Prompt taken from stt_video_using_assemblyai.sh
+            # Please check that script for consistency if prompts change
+            prompt = "Expected speakers [0] (0==any):"
+
+        try:
+            response = input(prompt).strip()
+            args.speakers = int(response) if response else 0
+        except ValueError:
+            print(f"> WARNING: Invalid number, using 0 (auto)", file=sys.stderr)
+            args.speakers = 0
+        except EOFError:
+            # Non-interactive, use default
+            args.speakers = 0
+
+    # Prompt for language if not provided
+    if args.language is None:
+        if backend == "openai":
+            # Prompt taken from stt_video_using_openai.sh
+            # Please check that script for consistency if prompts change
+            default = "auto"
+        else:
+            # Prompt taken from stt_video_using_speechmatics.sh / stt_video_using_assemblyai.sh
+            # Please check those scripts for consistency if prompts change
+            default = "en"
+
+        try:
+            response = input(f"Language code [{default}]:").strip()
+            args.language = response if response else default
+        except EOFError:
+            # Non-interactive, use default
+            args.language = default
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -351,6 +395,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     args = parse_args(argv)
+
+    # Prompt for missing args BEFORE any download
+    # This allows user to provide all input upfront and walk away
+    prompt_for_missing_args(args)
 
     input_path = args.input
     file_to_transcribe = None
