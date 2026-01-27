@@ -1,5 +1,7 @@
 #!/bin/bash
 
+BACKEND="speechmatics"
+
 if ! command -v stt_speechmatics.py &> /dev/null
 then
     echo 'The script stt_speechmatics.py is required to run this program.
@@ -11,13 +13,153 @@ then
     exit 1
 fi
 
-if [ $# -eq 0 ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
-  echo "Usage: $0 video_file [expected_speakers [language_code]]" >&2
-  echo >&2
-  echo "* video_file: The path to the video file you want to transcribe." >&2
-  echo "* expected_speakers: The maximum number of speakers in the video." >&2
-  echo "* language_code: Language code (default: en). Examples: de, fr, es, ja" >&2
+# Parse flags
+STATUS_MODE=false
+JSON_OUTPUT=false
+POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --status)
+      STATUS_MODE=true
+      shift
+      ;;
+    --json)
+      JSON_OUTPUT=true
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--status] [--json] video_file [max_speakers [language_code]]" >&2
+      echo >&2
+      echo "Options:" >&2
+      echo "  --status    Check if transcript exists without processing" >&2
+      echo "  --json      Output status in JSON format" >&2
+      echo >&2
+      echo "Arguments:" >&2
+      echo "  video_file: The path to the video file you want to transcribe." >&2
+      echo "  max_speakers: The maximum number of speakers in the video." >&2
+      echo "  language_code: Language code (default: en). Examples: de, fr, es, ja" >&2
+      exit 0
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+set -- "${POSITIONAL_ARGS[@]}"
+
+if [ $# -eq 0 ]; then
+  echo "Usage: $0 [--status] [--json] video_file [max_speakers [language_code]]" >&2
   exit 1
+fi
+
+VIDEO="$1"
+if [ ! -f "$VIDEO" ]; then
+  if [ "$STATUS_MODE" = true ]; then
+    if [ "$JSON_OUTPUT" = true ]; then
+      echo "{\"audio_path\": \"$VIDEO\", \"audio_exists\": false, \"mp3_path\": null, \"mp3_exists\": false, \"transcript_path\": null, \"transcript_exists\": false, \"backend\": \"$BACKEND\"}"
+    else
+      echo "Audio: $VIDEO (not found)"
+      echo "MP3: not found"
+      echo "Transcript: not found"
+    fi
+    exit 0
+  else
+    echo "Video file $VIDEO does not exist." >&2
+    exit 1
+  fi
+fi
+
+MP3="$VIDEO".mp3
+# New naming convention: include backend suffix
+TXT_NEW="$MP3"."$BACKEND".txt
+# Legacy naming for backward compatibility
+TXT_LEGACY="$MP3".txt
+
+# Determine which transcript file to use (prefer new, fallback to legacy)
+if [ -f "$TXT_NEW" ]; then
+  TXT="$TXT_NEW"
+  TXT_IS_LEGACY=false
+elif [ -f "$TXT_LEGACY" ]; then
+  TXT="$TXT_LEGACY"
+  TXT_IS_LEGACY=true
+else
+  TXT="$TXT_NEW"
+  TXT_IS_LEGACY=false
+fi
+
+# Status mode: just report what exists
+if [ "$STATUS_MODE" = true ]; then
+  MP3_EXISTS=false
+  MP3_SIZE=0
+  if [ -f "$MP3" ]; then
+    MP3_EXISTS=true
+    MP3_SIZE=$(stat -c%s "$MP3" 2>/dev/null || stat -f%z "$MP3" 2>/dev/null || echo 0)
+  fi
+
+  TXT_EXISTS=false
+  TXT_SIZE=0
+  TXT_PATH="$TXT_NEW"
+  if [ -f "$TXT_NEW" ]; then
+    TXT_EXISTS=true
+    TXT_SIZE=$(stat -c%s "$TXT_NEW" 2>/dev/null || stat -f%z "$TXT_NEW" 2>/dev/null || echo 0)
+    TXT_PATH="$TXT_NEW"
+    TXT_IS_LEGACY=false
+  elif [ -f "$TXT_LEGACY" ]; then
+    TXT_EXISTS=true
+    TXT_SIZE=$(stat -c%s "$TXT_LEGACY" 2>/dev/null || stat -f%z "$TXT_LEGACY" 2>/dev/null || echo 0)
+    TXT_PATH="$TXT_LEGACY"
+    TXT_IS_LEGACY=true
+  fi
+
+  if [ "$JSON_OUTPUT" = true ]; then
+    cat <<EOF
+{
+  "audio_path": "$VIDEO",
+  "audio_exists": true,
+  "mp3_path": "$MP3",
+  "mp3_exists": $MP3_EXISTS,
+  "mp3_size_bytes": $MP3_SIZE,
+  "transcript_path": "$TXT_PATH",
+  "transcript_exists": $TXT_EXISTS,
+  "transcript_size_bytes": $TXT_SIZE,
+  "transcript_legacy": $TXT_IS_LEGACY,
+  "backend": "$BACKEND"
+}
+EOF
+  else
+    echo "Audio: $VIDEO"
+    if [ "$MP3_EXISTS" = true ]; then
+      echo "MP3: exists ($MP3) - $(numfmt --to=iec $MP3_SIZE 2>/dev/null || echo "$MP3_SIZE bytes")"
+    else
+      echo "MP3: not found"
+    fi
+    if [ "$TXT_EXISTS" = true ]; then
+      LEGACY_NOTE=""
+      if [ "$TXT_IS_LEGACY" = true ]; then
+        LEGACY_NOTE=" [legacy naming]"
+      fi
+      echo "Transcript: exists ($TXT_PATH)$LEGACY_NOTE - $(numfmt --to=iec $TXT_SIZE 2>/dev/null || echo "$TXT_SIZE bytes")"
+    else
+      echo "Transcript: not found"
+    fi
+  fi
+  exit 0
+fi
+
+# Normal transcription mode
+max_speakers="${2:-}"
+if [ -z "$max_speakers" ]; then
+  read -p 'Max speakers [0] (0==any):' max_speakers
+  max_speakers="${max_speakers:-0}"
+fi
+
+LANGUAGE="${3:-}"
+if [ -z "$LANGUAGE" ]; then
+  read -p 'Language code [en]:' LANGUAGE
+  LANGUAGE="${LANGUAGE:-en}"
 fi
 
 function extract_mp3() {
@@ -52,34 +194,11 @@ function transcribe_with_diarization() {
   set +x
 }
 
-if [ $# -eq 0 ]; then
-  echo "Usage: $0 video_file expected_speakers" >&2
-  exit 0
-fi
-
-VIDEO="$1"
-if [ ! -f "$VIDEO" ]; then
-  echo "Video file $VIDEO does not exist." >&2
-  exit 1
-fi
-
-max_speakers="${2:-}"
-if [ -z "$max_speakers" ]; then
-  read -p 'Max speakers [0] (0==any):' max_speakers
-  max_speakers="${max_speakers:-0}"
-fi
-
-MP3="$VIDEO".mp3
-TXT="$MP3".txt
-
-LANGUAGE="${3:-}"
-if [ -z "$LANGUAGE" ]; then
-  read -p 'Language code [en]:' LANGUAGE
-  LANGUAGE="${LANGUAGE:-en}"
-fi
-
 # Extract MP3 if needed
 extract_mp3 "$VIDEO" "$MP3"
+
+# Use new naming convention for output
+TXT="$TXT_NEW"
 
 # Transcribe using Speechmatics
 # stt_speechmatics.py will handle idempotence - if transcript exists, it will display it
