@@ -7,7 +7,8 @@
 stt_video - Unified Speech-to-Text Wrapper
 
 A wrapper script that provides a unified interface for transcribing video/audio
-files using different STT backends (Speechmatics, OpenAI, AssemblyAI).
+files using different STT backends (Speechmatics, OpenAI, AssemblyAI) or
+downloading existing transcripts from video platforms (YouTube, etc.).
 
 Supports both local files and URLs. For URLs, automatically downloads audio
 using yt-dlp-priv.py (preferred) or falls back to yt-dlp, youtube-dl, or
@@ -23,6 +24,12 @@ Examples:
     # Transcribe YouTube video with OpenAI backend
     stt_video -b openai "https://youtube.com/watch?v=xyz"
 
+    # Download existing YouTube subtitles (prefer manual, fallback to auto)
+    stt_video -b youtube "https://youtube.com/watch?v=xyz"
+
+    # Download only manual (creator-uploaded) subtitles
+    stt_video -b youtube-sub "https://youtube.com/watch?v=xyz"
+
     # Transcribe with speaker diarization
     stt_video -s 3 -l de video.mp4
 
@@ -30,11 +37,12 @@ Examples:
     stt_video video.mp4 -- --operating-point enhanced
 
 Environment Variables:
-    STT_VIDEO_BACKEND: Default backend (speechmatics, openai, assemblyai)
+    STT_VIDEO_BACKEND: Default backend (speechmatics, openai, assemblyai, youtube, etc.)
                        Default: speechmatics
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -43,18 +51,67 @@ import tempfile
 from pathlib import Path
 
 
-# Supported backends and their script names
+# Supported STT backends and their script names
 BACKENDS = {
     "speechmatics": "stt_video_using_speechmatics.sh",
     "openai": "stt_video_using_openai.sh",
     "assemblyai": "stt_video_using_assemblyai.sh",
 }
 
+# Transcript pseudo-backends (download existing transcripts instead of running STT)
+# These use yt-dlp-priv.py to fetch subtitles from video platforms
+TRANSCRIPT_BACKENDS = {
+    # YouTube-specific
+    "youtube": {"provider": "youtube", "prefer": "manual", "fallback": "auto"},
+    "yt": {"provider": "youtube", "prefer": "manual", "fallback": "auto"},
+    "youtube-sub": {"provider": "youtube", "prefer": "manual", "fallback": None},
+    "yt-sub": {"provider": "youtube", "prefer": "manual", "fallback": None},
+    "youtube-auto": {"provider": "youtube", "prefer": "auto", "fallback": None},
+    "yt-auto": {"provider": "youtube", "prefer": "auto", "fallback": None},
+    # Generic (auto-detect provider from URL)
+    "transcript": {"provider": "auto", "prefer": "manual", "fallback": "auto"},
+    "transcript-sub": {"provider": "auto", "prefer": "manual", "fallback": None},
+    "transcript-auto": {"provider": "auto", "prefer": "auto", "fallback": None},
+}
+
+# All STT backend names for -b all (excludes transcript backends)
+ALL_BACKENDS = list(BACKENDS.keys())
+
+# All available backends (STT + transcript)
+ALL_AVAILABLE_BACKENDS = list(BACKENDS.keys()) + list(TRANSCRIPT_BACKENDS.keys())
+
 # Media file extensions for direct download detection
 MEDIA_EXTENSIONS = {
     ".mp3", ".mp4", ".m4a", ".wav", ".webm", ".ogg", ".flac",
     ".aac", ".mkv", ".avi", ".mov", ".wmv", ".opus",
 }
+
+
+def detect_transcript_provider(url: str) -> str | None:
+    """
+    Auto-detect transcript provider from URL.
+
+    Args:
+        url: Video URL
+
+    Returns:
+        Provider name ('youtube', 'vimeo', etc.) or None if unknown.
+    """
+    url_lower = url.lower()
+
+    # YouTube
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+
+    # Vimeo (future support)
+    if "vimeo.com" in url_lower:
+        return "vimeo"
+
+    # Dailymotion (future support)
+    if "dailymotion.com" in url_lower or "dai.ly" in url_lower:
+        return "dailymotion"
+
+    return None
 
 
 def is_url(path: str) -> bool:
@@ -107,6 +164,44 @@ def find_direct_download_tool() -> tuple[str, list[str]] | None:
     return None
 
 
+def _find_audio_files(directory: Path) -> list[Path]:
+    """
+    Find audio files in directory, preferring original formats over derived mp3.
+
+    Priority:
+    1. Original audio formats (.opus, .m4a, .wav, .webm) - most recent
+    2. Simple .mp3 files (not .xxx.mp3)
+    3. Any .mp3 file as last resort
+
+    This prevents cascading file extensions like .opus.mp3.mp3.mp3
+    """
+    # Original format files (prefer these)
+    original_exts = [".opus", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".aac"]
+    original_files = []
+    for ext in original_exts:
+        original_files.extend(directory.glob(f"*{ext}"))
+
+    # Filter out files with cascading extensions (e.g., .opus.mp3 should not match .opus)
+    original_files = [f for f in original_files if not str(f).endswith(('.mp3', '.txt', '.json', '.vtt', '.srt'))]
+
+    if original_files:
+        # Return most recently modified
+        return sorted(original_files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    # mp3 files - prefer those without cascading extensions
+    mp3_files = list(directory.glob("*.mp3"))
+    simple_mp3 = [f for f in mp3_files if not any(f.name.endswith(f"{ext}.mp3") for ext in original_exts)]
+
+    if simple_mp3:
+        return sorted(simple_mp3, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    # Fallback: any mp3, preferring shorter names (less cascading)
+    if mp3_files:
+        return sorted(mp3_files, key=lambda p: (len(p.name), -p.stat().st_mtime))
+
+    return []
+
+
 def download_from_url(url: str, output_dir: str | None = None) -> str | None:
     """
     Download audio from URL using best available tool.
@@ -142,24 +237,19 @@ def download_from_url(url: str, output_dir: str | None = None) -> str | None:
             # yt-dlp-priv.py prints destination directory at the end
             for line in result.stdout.strip().split("\n"):
                 if line and os.path.isdir(line):
-                    # Find the most recent audio file in directory
-                    audio_files = []
-                    for ext in [".mp3", ".m4a", ".opus", ".wav", ".webm"]:
-                        audio_files.extend(Path(line).glob(f"*{ext}"))
+                    # Find audio file - prefer original formats over derived mp3
+                    audio_files = _find_audio_files(Path(line))
                     if audio_files:
-                        # Return most recently modified
-                        return str(max(audio_files, key=lambda p: p.stat().st_mtime))
+                        return str(audio_files[0])
 
             # If we can't find the file, try stderr
             for line in result.stderr.strip().split("\n"):
                 if line.startswith("> Destination directory:"):
                     continue
                 if line and os.path.isdir(line):
-                    audio_files = []
-                    for ext in [".mp3", ".m4a", ".opus", ".wav", ".webm"]:
-                        audio_files.extend(Path(line).glob(f"*{ext}"))
+                    audio_files = _find_audio_files(Path(line))
                     if audio_files:
-                        return str(max(audio_files, key=lambda p: p.stat().st_mtime))
+                        return str(audio_files[0])
 
             print(f"> WARNING: Download completed but couldn't locate output file", file=sys.stderr)
             print(f"> Check the download directory manually", file=sys.stderr)
@@ -280,6 +370,96 @@ def run_stt(
         return 130
 
 
+def check_transcript_status(file_path: str, backends: list[str], json_output: bool = False) -> dict:
+    """
+    Check what transcripts already exist for a file.
+
+    Args:
+        file_path: Path to audio/video file
+        backends: List of backend names to check
+        json_output: If True, returns structured data; if False, prints human-readable
+
+    Returns:
+        Dict with status for each backend.
+    """
+    results = {
+        "file": file_path,
+        "file_exists": os.path.exists(file_path),
+        "backends": {}
+    }
+
+    if not results["file_exists"]:
+        if json_output:
+            print(json.dumps(results, indent=2))
+        else:
+            print(f"File: {file_path} (not found)")
+        return results
+
+    for backend in backends:
+        script = BACKENDS.get(backend)
+        if not script or not shutil.which(script):
+            results["backends"][backend] = {"error": "script not found"}
+            continue
+
+        cmd = [script, "--status", "--json", file_path]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            backend_status = json.loads(result.stdout)
+            results["backends"][backend] = backend_status
+        except subprocess.CalledProcessError as e:
+            results["backends"][backend] = {"error": str(e)}
+        except json.JSONDecodeError:
+            results["backends"][backend] = {"error": "invalid JSON response"}
+
+    if json_output:
+        print(json.dumps(results, indent=2))
+    else:
+        print(f"File: {file_path}")
+        for backend, status in results["backends"].items():
+            if "error" in status:
+                print(f"  {backend}: error - {status['error']}")
+            elif status.get("transcript_exists"):
+                size = status.get("transcript_size_bytes", 0)
+                path = status.get("transcript_path", "")
+                legacy = " [legacy]" if status.get("transcript_legacy") else ""
+                print(f"  {backend}: exists ({size} bytes){legacy}")
+                print(f"            {path}")
+            else:
+                print(f"  {backend}: not found")
+
+    return results
+
+
+def parse_backends(backend_arg: str) -> list[str]:
+    """
+    Parse backend argument which can be:
+    - Single backend: "speechmatics", "youtube", "yt"
+    - Multiple backends: "speechmatics,openai"
+    - All STT backends: "all"
+
+    Supports both STT backends (speechmatics, openai, assemblyai) and
+    transcript backends (youtube, yt, transcript, etc.).
+
+    Returns:
+        List of backend names.
+    """
+    if backend_arg.lower() == "all":
+        return ALL_BACKENDS.copy()
+
+    backends = [b.strip() for b in backend_arg.split(",") if b.strip()]
+
+    # Validate backends (check both STT and transcript backends)
+    invalid = [b for b in backends if b not in BACKENDS and b not in TRANSCRIPT_BACKENDS]
+    if invalid:
+        print(f"> ERROR: Unknown backend(s): {', '.join(invalid)}", file=sys.stderr)
+        print(f"> STT backends: {', '.join(BACKENDS.keys())}", file=sys.stderr)
+        print(f"> Transcript backends: {', '.join(TRANSCRIPT_BACKENDS.keys())}", file=sys.stderr)
+        print(f"> Use 'all' for all STT backends", file=sys.stderr)
+        sys.exit(1)
+
+    return backends
+
+
 def prompt_for_missing_args(args: argparse.Namespace) -> None:
     """
     Prompt user for missing speakers/language BEFORE download.
@@ -344,9 +524,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument(
         "--backend", "-b",
-        choices=list(BACKENDS.keys()),
         default=os.environ.get("STT_VIDEO_BACKEND", "speechmatics"),
-        help="STT backend to use (default: %(default)s, or STT_VIDEO_BACKEND env var)",
+        help="Backend(s) to use. STT backends: speechmatics, openai, assemblyai. "
+             "Transcript backends (download existing subtitles): youtube/yt, youtube-sub/yt-sub, "
+             "youtube-auto/yt-auto, transcript, transcript-sub, transcript-auto. "
+             "Can be comma-separated (speechmatics,openai) or 'all' for all STT backends. "
+             "(default: %(default)s, or STT_VIDEO_BACKEND env var)",
+    )
+
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Check if transcripts exist without processing. Reports status for each backend.",
+    )
+
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output status in machine-readable JSON format (use with --status).",
     )
 
     parser.add_argument(
@@ -396,6 +591,80 @@ def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     args = parse_args(argv)
 
+    # Parse backend argument into list
+    backends = parse_backends(args.backend)
+
+    # Handle --status flag: check what transcripts exist
+    if args.status:
+        input_path = args.input
+
+        # For URLs, we need to resolve where the file would be downloaded
+        if is_url(input_path):
+            # Try to get status from yt-dlp-priv.py if available
+            if shutil.which("yt-dlp-priv.py"):
+                print(f"> Checking download status for URL...", file=sys.stderr)
+                try:
+                    # Always get JSON to parse properly
+                    cmd = ["yt-dlp-priv.py", "--status", "--json", input_path]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+
+                    # Parse JSON output
+                    try:
+                        dl_status = json.loads(result.stdout)
+
+                        # Find audio file path to check transcripts
+                        audio_files = dl_status.get("audio", [])
+                        if audio_files:
+                            # Use first audio file
+                            audio_path = audio_files[0].get("path")
+                            if audio_path and os.path.exists(audio_path):
+                                print(f"> Audio found: {audio_path}", file=sys.stderr)
+                                print(f"> Checking transcript status...\n", file=sys.stderr)
+                                check_transcript_status(audio_path, backends, json_output=args.json)
+                                return 0
+
+                        # No audio file found - show download status
+                        if args.json:
+                            print(json.dumps({
+                                "url": input_path,
+                                "download_status": dl_status,
+                                "transcript_status": "no audio downloaded",
+                                "backends": {}
+                            }, indent=2))
+                        else:
+                            # Print human-readable download status
+                            print(f"URL: {dl_status.get('url', input_path)}")
+                            print(f"Video ID: {dl_status.get('video_id', 'unknown')}")
+                            print(f"Platform: {dl_status.get('platform', 'unknown')}")
+                            print(f"Destination: {dl_status.get('destination_dir', 'unknown')}")
+
+                            videos = dl_status.get("videos", [])
+                            print(f"Videos: {len(videos)} found" if videos else "Videos: none downloaded")
+
+                            audio = dl_status.get("audio", [])
+                            print(f"Audio: {len(audio)} found" if audio else "Audio: none downloaded")
+
+                            subtitles = dl_status.get("subtitles", [])
+                            print(f"Subtitles: {len(subtitles)} found" if subtitles else "Subtitles: none")
+
+                            print(f"\nTranscripts: cannot check - no audio file downloaded yet")
+                            print(f"\n> Run without --status to download and transcribe.", file=sys.stderr)
+                        return 0
+
+                    except json.JSONDecodeError:
+                        print(f"> WARNING: Could not parse yt-dlp-priv.py JSON output", file=sys.stderr)
+
+                except Exception as e:
+                    print(f"> WARNING: Could not check URL status: {e}", file=sys.stderr)
+
+            print(f"> ERROR: Cannot check transcript status for URL without downloading first", file=sys.stderr)
+            print(f"> Run without --status to download and transcribe, then use --status on the file.", file=sys.stderr)
+            return 1
+
+        # Local file status check
+        check_transcript_status(input_path, backends, json_output=args.json)
+        return 0
+
     # Prompt for missing args BEFORE any download
     # This allows user to provide all input upfront and walk away
     prompt_for_missing_args(args)
@@ -417,14 +686,51 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         file_to_transcribe = input_path
 
-    # Run STT
-    return run_stt(
-        file_path=file_to_transcribe,
-        backend=args.backend,
-        language=args.language,
-        speakers=args.speakers,
-        pass_through_args=args.pass_through,
-    )
+    # Check which backends already have transcripts (skip if already done)
+    backends_to_run = []
+    for backend in backends:
+        script = BACKENDS.get(backend)
+        if script and shutil.which(script):
+            # Quick check if transcript already exists
+            cmd = [script, "--status", "--json", file_to_transcribe]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                status = json.loads(result.stdout)
+                if status.get("transcript_exists"):
+                    print(f"> [{backend}] Transcript already exists, skipping.", file=sys.stderr)
+                    continue
+            except (subprocess.CalledProcessError, json.JSONDecodeError):
+                pass  # If status check fails, proceed with transcription
+
+        backends_to_run.append(backend)
+
+    if not backends_to_run:
+        print(f"> All requested transcripts already exist.", file=sys.stderr)
+        return 0
+
+    # Run STT for each backend
+    exit_code = 0
+    for i, backend in enumerate(backends_to_run):
+        if len(backends_to_run) > 1:
+            print(f"\n> [{i+1}/{len(backends_to_run)}] Running {backend}...", file=sys.stderr)
+
+        result = run_stt(
+            file_path=file_to_transcribe,
+            backend=backend,
+            language=args.language,
+            speakers=args.speakers,
+            pass_through_args=args.pass_through,
+        )
+
+        if result != 0:
+            exit_code = result
+            print(f"> [{backend}] STT failed with exit code {result}", file=sys.stderr)
+
+    if len(backends_to_run) > 1:
+        successful = len(backends_to_run) - (1 if exit_code != 0 else 0)
+        print(f"\n> Completed {successful}/{len(backends_to_run)} backends.", file=sys.stderr)
+
+    return exit_code
 
 
 if __name__ == "__main__":
