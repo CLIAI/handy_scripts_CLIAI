@@ -87,6 +87,92 @@ MEDIA_EXTENSIONS = {
 }
 
 
+def vtt_to_plain_text(vtt_path: Path) -> Path | None:
+    """
+    Convert VTT subtitle file to plain text (no timestamps).
+
+    Args:
+        vtt_path: Path to VTT file
+
+    Returns:
+        Path to created TXT file, or None on failure.
+    """
+    import re
+
+    # Determine output path: video.en.manual.vtt -> video.en.manual.txt
+    txt_path = vtt_path.with_suffix('.txt')
+
+    if txt_path.exists():
+        return txt_path  # Already converted
+
+    try:
+        with open(vtt_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        lines = content.strip().split('\n')
+        text_parts = []
+        seen_texts = set()
+        i = 0
+
+        # Skip WEBVTT header and metadata
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:'):
+                i += 1
+                continue
+            if not line:
+                i += 1
+                continue
+            break
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Skip empty lines
+            if not line:
+                i += 1
+                continue
+
+            # Skip timestamp lines (contain " --> ")
+            if ' --> ' in line:
+                i += 1
+                continue
+
+            # Skip cue identifiers (numeric lines)
+            if line.isdigit():
+                i += 1
+                continue
+
+            # Process text lines - remove timing tags
+            clean_line = re.sub(r'<[^>]+>', '', line)
+            clean_line = clean_line.strip()
+
+            # Skip empty after cleaning
+            if not clean_line:
+                i += 1
+                continue
+
+            # Deduplicate
+            if clean_line not in seen_texts:
+                seen_texts.add(clean_line)
+                text_parts.append(clean_line)
+
+            i += 1
+
+        # Join into paragraph
+        paragraph = ' '.join(text_parts)
+        paragraph = re.sub(r'\s+', ' ', paragraph).strip()
+
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(paragraph)
+
+        return txt_path
+
+    except Exception as e:
+        print(f"> WARNING: VTT to TXT conversion failed for {vtt_path}: {e}", file=sys.stderr)
+        return None
+
+
 def detect_transcript_provider(url: str) -> str | None:
     """
     Auto-detect transcript provider from URL.
@@ -431,7 +517,23 @@ def run_transcript_backend(
             print(f"> [{backend}] Downloaded {len(downloaded_files)} transcript file(s):", file=sys.stderr)
             for f in downloaded_files:
                 print(f">   {f}", file=sys.stderr)
-            return (0, downloaded_files)
+
+            # Convert VTT files to plain text
+            txt_files = []
+            for vtt_file in downloaded_files:
+                if vtt_file.suffix.lower() == '.vtt':
+                    txt_file = vtt_to_plain_text(vtt_file)
+                    if txt_file:
+                        txt_files.append(txt_file)
+
+            if txt_files:
+                print(f"> [{backend}] Converted to plain text:", file=sys.stderr)
+                for f in txt_files:
+                    print(f">   {f}", file=sys.stderr)
+
+            # Return both VTT and TXT files
+            all_files = downloaded_files + txt_files
+            return (0, all_files)
         else:
             print(f"> [{backend}] No transcript files found after download", file=sys.stderr)
             return (1, [])
