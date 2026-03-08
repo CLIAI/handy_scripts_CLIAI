@@ -406,6 +406,7 @@ def run_transcript_backend(
     backend: str,
     language: str | None,
     output_dir: Path | None = None,
+    frontmatter: bool = False,
 ) -> tuple[int, list[Path]]:
     """
     Download transcripts from video platform using yt-dlp-priv.py.
@@ -415,6 +416,7 @@ def run_transcript_backend(
         backend: Transcript backend name (youtube, yt, transcript, etc.)
         language: Language code or None for auto-detect
         output_dir: Optional output directory
+        frontmatter: If True, prepend YAML frontmatter with metadata
 
     Returns:
         Tuple of (exit_code, list_of_transcript_files)
@@ -465,6 +467,10 @@ def run_transcript_backend(
             cmd.extend(["--transcript-lang", "all"])
         else:
             cmd.extend(["--transcript-lang", language])
+
+    # Add frontmatter flag if requested
+    if frontmatter:
+        cmd.append("--frontmatter")
 
     cmd.append(url)
 
@@ -792,6 +798,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output directory for URL downloads (overrides default destination)",
     )
 
+    parser.add_argument(
+        "--frontmatter",
+        action="store_true",
+        help="Prepend YAML frontmatter with metadata (title, author, date, URL). "
+             "Only applies to transcript backends (youtube, yt, etc.).",
+    )
+
     # Collect pass-through arguments
     parser.add_argument(
         "pass_through",
@@ -924,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend=backend,
                 language=args.language,
                 output_dir=Path(args.output_dir) if args.output_dir else None,
+                frontmatter=args.frontmatter,
             )
 
             if result_code != 0:
