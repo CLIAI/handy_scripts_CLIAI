@@ -10,6 +10,7 @@
 # https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
 
 import argparse
+import re
 import sys
 import os
 from google.cloud import texttospeech
@@ -28,7 +29,7 @@ def parse_input(input_file):
         if line:
             if ':' in line:
                 speaker, text = line.split(':', 1)
-                speaker = speaker.strip()
+                speaker = re.sub(r'[*_~`]', '', speaker).strip()
                 text = text.strip()
 
                 if speaker not in speakers:
@@ -55,27 +56,59 @@ def parse_input(input_file):
 def choose_audio_encoding():
     return get_audio_encoding(args.encoding) if args.encoding else texttospeech.AudioEncoding.MP3
 
+def list_voices():
+    client = texttospeech.TextToSpeechClient()
+    response = client.list_voices(language_code=args.language)
+    multi_speaker = []
+    other = []
+    for voice in response.voices:
+        lang_codes = ", ".join(voice.language_codes)
+        gender = texttospeech.SsmlVoiceGender(voice.ssml_gender).name
+        entry = f"  {voice.name}  ({lang_codes}, {gender})"
+        if "MultiSpeaker" in voice.name:
+            multi_speaker.append(entry)
+        else:
+            other.append(entry)
+    if multi_speaker:
+        print("Multi-Speaker voices:")
+        print("\n".join(multi_speaker))
+    if other:
+        print(f"\nOther voices for {args.language}:" if args.language else "\nOther voices:")
+        print("\n".join(other))
+
 def generate_audio(turns):
     client = texttospeech.TextToSpeechClient()
-    
+
     multi_speaker_markup = texttospeech.MultiSpeakerMarkup()
     multi_speaker_markup.turns.extend(turns)
-    
+
     synthesis_input = texttospeech.SynthesisInput(multi_speaker_markup=multi_speaker_markup)
-    
+
     voice = texttospeech.VoiceSelectionParams(
-        language_code="en-US", name="en-US-Studio-MultiSpeaker"
+        language_code=args.language, name=args.voice_name
     )
-    
+
     audio_encoding = choose_audio_encoding()
     encoding_str = next(key for key, value in encoding_map.items() if value == audio_encoding)
     log_verbose("DEB:Chosen audio encoding: {}", encoding_str)
-    audio_config = texttospeech.AudioConfig(audio_encoding=audio_encoding)
-    
+
+    audio_config_kwargs = {"audio_encoding": audio_encoding}
+    if args.rate is not None:
+        audio_config_kwargs["speaking_rate"] = args.rate
+    if args.pitch is not None:
+        audio_config_kwargs["pitch"] = args.pitch
+    if args.sample_rate is not None:
+        audio_config_kwargs["sample_rate_hertz"] = args.sample_rate
+    if args.audio_profile:
+        audio_config_kwargs["effects_profile_id"] = args.audio_profile
+
+    audio_config = texttospeech.AudioConfig(**audio_config_kwargs)
+    log_verbose("DEB:AudioConfig: {}", audio_config_kwargs)
+
     response = client.synthesize_speech(
         input=synthesis_input, voice=voice, audio_config=audio_config
     )
-    
+
     return response.audio_content
 
 encoding_map = {
@@ -105,13 +138,35 @@ def get_audio_encoding(encoding_str):
 def main():
     global args
     parser = argparse.ArgumentParser(description="Generate multi-speaker audio from input text.")
-    parser.add_argument("-i", "--input", required=True, help="Input file (use '-' for stdin)")
+    parser.add_argument("-i", "--input", default=None, help="Input file (use '-' for stdin)")
     parser.add_argument("-s", "--speakers", default="R,S,T,U", help="Speaker mapping (comma-separated) [R,S,T,U]")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable verbose logging")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Run the script without generating or writing audio")
     parser.add_argument("-e", "--encoding", default=None, help="Audio encoding (wav, mp3, ogg, mulaw, alaw)")
     parser.add_argument("-o", "--output", default=None, help="Output file (default is input filename with appropriate extension)")
+    parser.add_argument("-l", "--language", default="en-US", help="Language code (default: en-US)")
+    parser.add_argument("--voice-name", default=None, help="Voice name (default: {language}-Studio-MultiSpeaker)")
+    parser.add_argument("--rate", type=float, default=None, help="Speaking rate 0.25-4.0 (default: 1.0)")
+    parser.add_argument("--pitch", type=float, default=None, help="Pitch in semitones -20.0 to 20.0 (default: 0.0)")
+    parser.add_argument("--sample-rate", type=int, default=None, help="Sample rate in Hz (e.g. 16000, 24000, 48000)")
+    parser.add_argument("--audio-profile", action="append", default=None,
+                        help="Audio device profile (can be repeated). Options: "
+                             "headphone-class-device, handset-class-device, "
+                             "small-bluetooth-speaker-class-device, medium-bluetooth-speaker-class-device, "
+                             "large-home-entertainment-class-device, large-automotive-class-device, "
+                             "telephony-class-application, wearable-class-device")
+    parser.add_argument("--list-voices", action="store_true", help="List available voices and exit")
     args = parser.parse_args()
+
+    if args.voice_name is None:
+        args.voice_name = f"{args.language}-Studio-MultiSpeaker"
+
+    if args.list_voices:
+        list_voices()
+        sys.exit(0)
+
+    if args.input is None:
+        parser.error("the following arguments are required: -i/--input")
 
     args.speakers = args.speakers.split(',')
 
