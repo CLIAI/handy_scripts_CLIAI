@@ -1461,7 +1461,7 @@ def prompt_interactive_with_suggestions(
 
     # Then prompt for confirmation/override
     print("\n=== Review and Confirm ===", file=sys.stderr)
-    print("  Enter=accept | name=override | skip=abort | speak=hear speaker | help=commands", file=sys.stderr)
+    print("  Enter=accept | name=override | skip=abort | s(peak)=play | help=commands", file=sys.stderr)
     print("  !cmd: run shell commands with {a}udio {t}ext {j}son {mt}apped-text placeholders", file=sys.stderr)
     print("", file=sys.stderr)
 
@@ -1502,7 +1502,7 @@ def prompt_interactive_with_suggestions(
                     print("", file=sys.stderr)
                 continue  # Re-prompt for same speaker
 
-            elif user_input.lower().startswith('speak'):
+            elif user_input.lower() == 's' or user_input.lower().startswith('speak'):
                 # Preview audio samples for a speaker
                 if json_data is None:
                     print("ERROR: Audio preview not available (no JSON data)", file=sys.stderr)
