@@ -1,12 +1,12 @@
 #!/usr/bin/env -S uv run
 # /// script
 # dependencies = [
-#   "google-cloud-texttospeech>=2.14.0",
+#   "google-cloud-texttospeech>=2.31.0",
 # ]
 # requires-python = ">=3.11"
 # ///
 
-# Generate dialogue with multiple speakers
+# Generate multi-speaker dialogue audio using Gemini TTS
 # https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
 
 import argparse
@@ -15,12 +15,24 @@ import sys
 import os
 from google.cloud import texttospeech
 
+# 30 Gemini TTS prebuilt voices - used for auto-assigning to speakers
+GEMINI_VOICES = [
+    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
+    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
+    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+]
+
+
 def log_verbose(message, *format_args):
     if args.verbose:
         print(message.format(*format_args), file=sys.stderr)
 
+
 def parse_input(input_file):
-    speakers = {}
+    """Parse 'Speaker: text' dialogue format into (speaker_name, text) tuples."""
+    speakers_seen = []  # ordered list of unique speaker names
     turns = []
     last_speaker = None
 
@@ -32,60 +44,102 @@ def parse_input(input_file):
                 speaker = re.sub(r'[*_~`]', '', speaker).strip()
                 text = text.strip()
 
-                if speaker not in speakers:
-                    if len(speakers) >= len(args.speakers):
-                        raise ValueError("More than {} speakers detected in the input.".format(len(args.speakers)))
-                    speakers[speaker] = args.speakers[len(speakers)]
+                if speaker not in speakers_seen:
+                    speakers_seen.append(speaker)
                     if args.verbose:
-                        print('DEB:SPEAKER[{}]="{}"'.format(speaker, speakers[speaker]), file=sys.stderr)
+                        print(f'DEB:SPEAKER[{speaker}] (#{len(speakers_seen)})', file=sys.stderr)
             else:
                 text = line
                 speaker = last_speaker
 
-            turn = texttospeech.MultiSpeakerMarkup.Turn()
-            turn.text = text
-            turn.speaker = speakers[speaker]
-            turns.append(turn)
+            turns.append((speaker, text))
             last_speaker = speaker
 
             if args.verbose > 1:
-                print('APPEND:[{} as "{}"]:{}'.format(speaker, speakers[speaker], text), file=sys.stderr)
+                print(f'APPEND:[{speaker}]:{text}', file=sys.stderr)
 
-    return turns
+    return turns, speakers_seen
+
+
+def build_voice_map(speakers_seen):
+    """Map speaker names to Gemini voice IDs.
+
+    Uses --voices if provided (comma-separated voice IDs matching speaker order),
+    otherwise auto-assigns from GEMINI_VOICES pool.
+    """
+    if args.voices:
+        voice_list = args.voices.split(',')
+        if len(voice_list) < len(speakers_seen):
+            print(f"ERROR: {len(speakers_seen)} speakers found but only {len(voice_list)} voices specified with --voices",
+                  file=sys.stderr)
+            sys.exit(1)
+        voice_map = {}
+        for i, speaker in enumerate(speakers_seen):
+            voice_map[speaker] = voice_list[i].strip()
+        return voice_map
+
+    # Auto-assign: cycle through GEMINI_VOICES
+    voice_map = {}
+    for i, speaker in enumerate(speakers_seen):
+        voice_map[speaker] = GEMINI_VOICES[i % len(GEMINI_VOICES)]
+    return voice_map
+
 
 def choose_audio_encoding():
     return get_audio_encoding(args.encoding) if args.encoding else texttospeech.AudioEncoding.MP3
 
+
 def list_voices():
+    """List available voices for the specified language."""
     client = texttospeech.TextToSpeechClient()
     response = client.list_voices(language_code=args.language)
-    multi_speaker = []
-    other = []
+
+    print(f"Gemini TTS prebuilt voices (for --voices flag):")
+    for v in GEMINI_VOICES:
+        print(f"  {v}")
+
+    print(f"\nAll Cloud TTS voices for {args.language}:")
     for voice in response.voices:
         lang_codes = ", ".join(voice.language_codes)
         gender = texttospeech.SsmlVoiceGender(voice.ssml_gender).name
-        entry = f"  {voice.name}  ({lang_codes}, {gender})"
-        if "MultiSpeaker" in voice.name:
-            multi_speaker.append(entry)
-        else:
-            other.append(entry)
-    if multi_speaker:
-        print("Multi-Speaker voices:")
-        print("\n".join(multi_speaker))
-    if other:
-        print(f"\nOther voices for {args.language}:" if args.language else "\nOther voices:")
-        print("\n".join(other))
+        print(f"  {voice.name}  ({lang_codes}, {gender})")
 
-def generate_audio(turns):
+
+def generate_audio(turns, speakers_seen):
+    """Generate multi-speaker audio using Gemini TTS."""
     client = texttospeech.TextToSpeechClient()
 
-    multi_speaker_markup = texttospeech.MultiSpeakerMarkup()
-    multi_speaker_markup.turns.extend(turns)
+    voice_map = build_voice_map(speakers_seen)
+    for speaker, voice_id in voice_map.items():
+        log_verbose("DEB:VOICE_MAP[{}] = {}", speaker, voice_id)
 
-    synthesis_input = texttospeech.SynthesisInput(multi_speaker_markup=multi_speaker_markup)
+    # Build freeform text: "Speaker: line\nSpeaker2: line\n..."
+    freeform_lines = []
+    for speaker, text in turns:
+        freeform_lines.append(f"{speaker}: {text}")
+    freeform_text = "\n".join(freeform_lines)
+
+    input_kwargs = {"text": freeform_text}
+    if args.prompt:
+        input_kwargs["prompt"] = args.prompt
+    synthesis_input = texttospeech.SynthesisInput(**input_kwargs)
+
+    # Build multi-speaker voice config
+    speaker_voice_configs = []
+    for speaker, voice_id in voice_map.items():
+        speaker_voice_configs.append(
+            texttospeech.MultispeakerPrebuiltVoice(
+                speaker_alias=speaker,
+                speaker_id=voice_id,
+            )
+        )
 
     voice = texttospeech.VoiceSelectionParams(
-        language_code=args.language, name=args.voice_name
+        language_code=args.language,
+        model_name=args.model,
+        multi_speaker_voice_config=texttospeech.MultiSpeakerVoiceConfig(
+            speaker_voice_configs=speaker_voice_configs,
+        ),
     )
 
     audio_encoding = choose_audio_encoding()
@@ -101,6 +155,8 @@ def generate_audio(turns):
         audio_config_kwargs["volume_gain_db"] = args.volume
     if args.sample_rate is not None:
         audio_config_kwargs["sample_rate_hertz"] = args.sample_rate
+    else:
+        audio_config_kwargs["sample_rate_hertz"] = 24000
     if args.audio_profile:
         audio_config_kwargs["effects_profile_id"] = args.audio_profile
 
@@ -113,6 +169,7 @@ def generate_audio(turns):
 
     return response.audio_content
 
+
 encoding_map = {
     "LINEAR16": texttospeech.AudioEncoding.LINEAR16,
     "WAV": texttospeech.AudioEncoding.LINEAR16,
@@ -121,8 +178,8 @@ encoding_map = {
     "OGG": texttospeech.AudioEncoding.OGG_OPUS,
     "MULAW": texttospeech.AudioEncoding.MULAW,
     "ALAW": texttospeech.AudioEncoding.ALAW,
-    # "FLAC": texttospeech.AudioEncoding.FLAC,  # not yet supported: https://github.com/googleapis/google-cloud-python/issues/13239
 }
+
 
 def get_audio_encoding(encoding_str):
     encoding = encoding_map.get(encoding_str.upper())
@@ -132,33 +189,41 @@ def get_audio_encoding(encoding_str):
         sys.exit(1)
     return encoding
 
+
 def main():
     global args
-    parser = argparse.ArgumentParser(description="Generate multi-speaker audio from input text.")
-    parser.add_argument("-i", "--input", default=None, help="Input file (use '-' for stdin)")
-    parser.add_argument("-s", "--speakers", default="R,S,T,U,V,W,X,Y", help="Speaker mapping (comma-separated, up to 8) [R,S,T,U,V,W,X,Y]")
-    parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable verbose logging")
-    parser.add_argument("-n", "--dry-run", action="store_true", help="Run the script without generating or writing audio")
+    parser = argparse.ArgumentParser(
+        description="Generate multi-speaker dialogue audio using Gemini TTS.",
+        epilog="Example: %(prog)s -i dialogue.txt --voices Charon,Kore --prompt 'Friendly conversation'",
+    )
+    parser.add_argument("-i", "--input", default=None, help="Input file with 'Speaker: text' format (use '-' for stdin)")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable verbose logging (-vv for more)")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Parse input and show plan without generating audio")
     parser.add_argument("-e", "--encoding", default=None, help="Audio encoding (wav, mp3, ogg, mulaw, alaw)")
-    parser.add_argument("-o", "--output", default=None, help="Output file (default is input filename with appropriate extension)")
+    parser.add_argument("-o", "--output", default=None, help="Output file (default: input filename + extension)")
     parser.add_argument("-f", "--force", action="store_true", help="Overwrite output file if it already exists")
-    parser.add_argument("-l", "--language", default="en-US", help="Language code (default: en-US)")
-    parser.add_argument("--voice-name", default=None, help="Voice name (default: {language}-Studio-MultiSpeaker)")
+    parser.add_argument("-l", "--language", default="en-US",
+                        help="BCP-47 language code, e.g. en-US, de-DE, fr-FR, ja-JP, ko-KR (default: en-US)")
+    parser.add_argument("-m", "--model", default="gemini-2.5-flash-tts",
+                        help="Gemini TTS model (default: gemini-2.5-flash-tts). Options: "
+                             "gemini-2.5-flash-tts, gemini-2.5-pro-tts")
+    parser.add_argument("-p", "--prompt", default=None,
+                        help="Natural language style prompt for delivery, e.g. "
+                             "'Casual conversation between friends' or 'News anchor reading headlines'")
+    parser.add_argument("--voices", default=None,
+                        help="Comma-separated Gemini voice IDs for speakers in order of appearance. "
+                             "E.g. 'Charon,Kore' assigns first speaker to Charon, second to Kore. "
+                             "Available: Zephyr, Puck, Charon, Kore, Fenrir, Leda, Orus, Aoede, etc. "
+                             "Use --list-voices to see all. If omitted, auto-assigned.")
     parser.add_argument("--rate", type=float, default=None, help="Speaking rate 0.25-4.0 (default: 1.0)")
     parser.add_argument("--pitch", type=float, default=None, help="Pitch in semitones -20.0 to 20.0 (default: 0.0)")
-    parser.add_argument("--volume", type=float, default=None, help="Volume gain in dB -96.0 to 16.0 (default: 0.0, recommend max +10)")
-    parser.add_argument("--sample-rate", type=int, default=None, help="Sample rate in Hz (e.g. 16000, 24000, 48000)")
+    parser.add_argument("--volume", type=float, default=None, help="Volume gain in dB -96.0 to 16.0 (default: 0.0)")
+    parser.add_argument("--sample-rate", type=int, default=None, help="Sample rate in Hz (default: 24000)")
     parser.add_argument("--audio-profile", action="append", default=None,
-                        help="Audio device profile (can be repeated). Options: "
-                             "headphone-class-device, handset-class-device, "
-                             "small-bluetooth-speaker-class-device, medium-bluetooth-speaker-class-device, "
-                             "large-home-entertainment-class-device, large-automotive-class-device, "
-                             "telephony-class-application, wearable-class-device")
+                        help="Audio device profile (repeatable): headphone-class-device, "
+                             "handset-class-device, telephony-class-application, etc.")
     parser.add_argument("--list-voices", action="store_true", help="List available voices and exit")
     args = parser.parse_args()
-
-    if args.voice_name is None:
-        args.voice_name = f"{args.language}-Studio-MultiSpeaker"
 
     if args.list_voices:
         list_voices()
@@ -166,8 +231,6 @@ def main():
 
     if args.input is None:
         parser.error("the following arguments are required: -i/--input")
-
-    args.speakers = args.speakers.split(',')
 
     if args.input == '-':
         input_file = sys.stdin
@@ -186,33 +249,42 @@ def main():
         print(f"SKIPPING:ALREADY_EXISTS:{output_file} (use --force to overwrite)", file=sys.stderr)
         sys.exit(1)
 
-    log_verbose(f"Processing input from {args.input}")
+    log_verbose("Processing input from {}", args.input)
     try:
-        turns = parse_input(input_file)
+        turns, speakers_seen = parse_input(input_file)
     finally:
         if input_file is not sys.stdin:
             input_file.close()
 
-    input_bytes = sum(len(t.text.encode('utf-8')) for t in turns)
-    log_verbose("DEB:Parsed {} turns from {} speakers, ~{} bytes of text", len(turns), len(set(t.speaker for t in turns)), input_bytes)
+    input_bytes = sum(len(text.encode('utf-8')) for _, text in turns)
+    voice_map = build_voice_map(speakers_seen)
 
-    if input_bytes > 5000:
-        print(f"WARNING: Input text is ~{input_bytes} bytes, API limit is 5000 bytes. Request may fail.", file=sys.stderr)
+    log_verbose("DEB:Parsed {} turns from {} speakers, ~{} bytes of text", len(turns), len(speakers_seen), input_bytes)
+    log_verbose("DEB:Model: {}, Language: {}", args.model, args.language)
+    if args.prompt:
+        log_verbose("DEB:Prompt: {}", args.prompt)
+
+    if input_bytes > 8000:
+        print(f"WARNING: Input text is ~{input_bytes} bytes, Gemini TTS limit is ~8000 bytes (prompt+text). Request may fail.", file=sys.stderr)
 
     if not args.dry_run:
         log_verbose("Generating audio")
-        audio_content = generate_audio(turns)
+        audio_content = generate_audio(turns, speakers_seen)
 
-        log_verbose(f"Writing audio to {output_file}")
+        log_verbose("Writing audio to {}", output_file)
         with open(output_file, "wb") as out:
             out.write(audio_content)
 
         print(f'Audio content written to file "{output_file}"')
     else:
-        audio_encoding = choose_audio_encoding()
-        encoding_str = next(key for key, value in encoding_map.items() if value == audio_encoding)
-        log_verbose("DEB:Chosen audio encoding: {}", encoding_str)
-        print(f"Dry run: {len(turns)} turns, ~{input_bytes} bytes. Output would be: {output_file}")
+        print(f"Dry run: {len(turns)} turns, {len(speakers_seen)} speakers, ~{input_bytes} bytes")
+        print(f"  Model: {args.model}  Language: {args.language}")
+        for speaker, voice_id in voice_map.items():
+            print(f"  {speaker} -> {voice_id}")
+        if args.prompt:
+            print(f"  Prompt: {args.prompt}")
+        print(f"  Output would be: {output_file}")
+
 
 if __name__ == "__main__":
     main()
