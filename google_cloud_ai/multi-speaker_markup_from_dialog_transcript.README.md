@@ -121,8 +121,8 @@ Available profiles:
 
 ## Long Dialogues (Chunking)
 
-The Gemini TTS API has an **8000 byte combined limit** (text + prompt). For
-dialogues exceeding this, use `--chunk`:
+Freeform multi-speaker mode has a **4000 byte limit** on dialogue text
+(including `"Speaker: "` prefixes). For dialogues exceeding this, use `--chunk`:
 
 ```bash
 uv run multi-speaker_markup_from_dialog_transcript.py \

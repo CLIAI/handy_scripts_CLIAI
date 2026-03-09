@@ -95,12 +95,12 @@ Errors and warnings go to stderr.
 All output is machine-readable JSONL (one JSON object per line) on stdout.
 Each line has an "event" field. Events emitted:
 
-    {"event":"parsed","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"freeform_bytes":455,"prompt_bytes":42,"total_api_bytes":497,"api_limit_bytes":8000,"voice_map":{"Teacher":"Orus","Student":"Aoede"}}
+    {"event":"parsed","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"freeform_bytes":455,"prompt_bytes":42,"total_api_bytes":497,"api_limit_bytes":4000,"voice_map":{"Teacher":"Orus","Student":"Aoede"}}
     {"event":"generating","model":"gemini-2.5-flash-tts","language":"en-US","encoding":"LINEAR16","prompt":"..."}
     {"event":"completed","output_files":["out.wav","out.ogg","out.mp3"],"primary_file":"out.wav","audio_bytes":96288,"duration_seconds":1.23,"transcoded":[{"file":"out.ogg","format":"ogg","bytes":12345},{"file":"out.mp3","format":"mp3","bytes":23456}]}
     {"event":"dry_run","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"voice_map":{"Teacher":"Orus","Student":"Aoede"},"output_files":["out.wav","out.ogg","out.mp3"],"transcode":true}
     {"event":"skipped","output_file":"out.wav","reason":"already_exists"}
-    {"event":"warning","message":"Estimated API payload is ~9000 bytes (text:8500 + prompt:500), Gemini TTS limit is ~8000 bytes. Request may fail. See: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers"}
+    {"event":"warning","message":"Estimated API payload is ~5000 bytes (text:4500 + prompt:500), freeform multi-speaker limit is ~4000 bytes. Request may fail. See: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers"}
     {"event":"error","message":"2 speakers found but only 1 voices specified with --voices"}
 
 Errors in JSONL mode are also printed as JSONL to stdout (not stderr) and
@@ -169,16 +169,21 @@ Note: Both use Chirp 3 HD voices which do NOT support SSML input,
 speaking rate, pitch parameters, or A-Law encoding.
 
 ## Input Size Limits
-- Standard Cloud TTS v1: 5000 bytes (text or SSML)
-- Gemini TTS: 8000 bytes combined (text + prompt fields)
-  Note: the freeform text includes "Speaker: " prefixes per turn, which add
-  to the byte count beyond the raw dialogue text.
+The limits differ by mode — freeform multi-speaker is the most restrictive:
+
+- Freeform multi-speaker (our mode): 4000 bytes for dialogue text
+  This is the TOTAL freeform text including "Speaker: " prefixes per turn.
+  NOT the 8000 byte figure from the single-speaker docs.
+- Gemini TTS single-speaker: text ≤ 4000, prompt ≤ 4000, combined ≤ 8000
+- Structured MultiSpeakerMarkup: markup ≤ 4000, prompt ≤ 4000, combined ≤ 8000
+- Vertex AI API: 8000 bytes unified (contents field)
+- Standard Cloud TTS v1 (non-Gemini): 5000 bytes (text or SSML)
 - Output audio: ~655 seconds max duration (truncated if exceeded)
 - Source: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
-  (see also: REST API ref at /rest/v1/text/synthesize for v1 limits)
+  See also: https://cloud.google.com/text-to-speech/docs/gemini-tts
 
 ## Chunked Generation (--chunk)
-When input exceeds the ~8000 byte API limit, use --chunk to automatically split
+When input exceeds the ~4000 byte freeform multi-speaker limit, use --chunk to
 the dialogue into multiple API calls and concatenate the audio output.
 - Splits only at turn boundaries (never mid-sentence)
 - Each chunk includes all speaker voice configs (for voice consistency)
@@ -274,7 +279,8 @@ Key facts to verify:
 - MP3 is "MP3 audio at 32kbps" (AudioEncoding enum in REST API ref)
 - OGG_OPUS: "considerably higher than MP3 while using approximately the same
   bitrate" (AudioEncoding enum in REST API ref)
-- Gemini TTS combined limit: 8000 bytes text+prompt (multi-speaker guide)
+- Freeform multi-speaker: 4000 bytes dialogue text (NOT 8000!)
+- Gemini TTS single-speaker: text ≤ 4000, prompt ≤ 4000, combined ≤ 8000
 - Chirp 3 HD voices: no SSML, no rate/pitch, no A-Law (voices page)
 - AudioConfig has exactly 6 fields: audioEncoding, speakingRate, pitch,
   volumeGainDb, sampleRateHertz, effectsProfileId (REST API ref)
@@ -384,10 +390,15 @@ def list_voices():
         print(f"  {voice.name}  ({lang_codes}, {gender})")
 
 
-# Gemini TTS combined limit: 8000 bytes (text + prompt)
-# Use 7500 as effective limit for safety margin
+# Gemini TTS freeform multi-speaker limit: 4000 bytes for dialogue text
+# (NOT the 8000 byte combined limit — that applies to single-speaker and
+# structured MultiSpeakerMarkup mode only)
+# The freeform text includes "Speaker: " prefixes per turn, so the actual
+# API payload is larger than the raw dialogue text.
+# Use 3500 as effective limit for safety margin below 4000.
 # Source: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
-CHUNK_MAX_BYTES = 7500
+# See also: https://cloud.google.com/text-to-speech/docs/gemini-tts
+CHUNK_MAX_BYTES = 3500
 
 
 def freeform_line_bytes(speaker, text):
@@ -712,9 +723,10 @@ def main():
 
     # Modes
     parser.add_argument("--chunk", action="store_true",
-                        help="Enable chunked generation for long dialogues that exceed the ~8000 byte "
-                             "API limit. Splits at turn boundaries, makes multiple API calls, and "
-                             "concatenates the audio. Without this flag, oversized input produces a warning.")
+                        help="Enable chunked generation for long dialogues that exceed the ~4000 byte "
+                             "freeform multi-speaker limit. Splits at turn boundaries, makes multiple "
+                             "API calls, and concatenates the audio. Without this flag, oversized input "
+                             "produces a warning.")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Parse input and show plan without calling the API")
     parser.add_argument("-v", "--verbose", action="count", default=0,
@@ -793,7 +805,8 @@ def main():
     if args.prompt:
         log_verbose("DEB:Prompt: {}", args.prompt)
 
-    # Gemini TTS combined limit: 8000 bytes (text + prompt)
+    # Freeform multi-speaker limit: 4000 bytes for dialogue text
+    # (NOT the 8000 byte limit from single-speaker/structured docs)
     # Source: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
     # Note: freeform_text includes "Speaker: " prefixes per turn, so actual API payload > input_bytes
     freeform_bytes = sum(len(f"{spk}: {txt}".encode('utf-8')) for spk, txt in turns) + len(turns) - 1  # newlines
@@ -802,7 +815,7 @@ def main():
     needs_chunking = total_api_bytes > CHUNK_MAX_BYTES
     if needs_chunking and not args.chunk:
         emit_warning(f"Estimated API payload is ~{total_api_bytes} bytes (text:{freeform_bytes} + prompt:{prompt_bytes}), "
-                     f"Gemini TTS limit is ~8000 bytes. Request may fail. "
+                     f"freeform multi-speaker limit is ~4000 bytes. Request may fail. "
                      f"Use --chunk to automatically split into multiple API calls. "
                      f"See: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers")
 
@@ -817,7 +830,7 @@ def main():
         "freeform_bytes": freeform_bytes,
         "prompt_bytes": prompt_bytes,
         "total_api_bytes": total_api_bytes,
-        "api_limit_bytes": 8000,
+        "api_limit_bytes": 4000,
         "chunks_needed": chunk_count,
         "chunking_enabled": args.chunk,
         "voice_map": voice_map,

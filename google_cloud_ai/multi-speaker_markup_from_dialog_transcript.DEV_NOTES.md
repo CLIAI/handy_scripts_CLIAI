@@ -78,8 +78,14 @@ names as-is (after stripping markdown).
 
 ### Byte limit and chunking
 
-* **API limit**: 8000 bytes combined (text + prompt fields)
-* **Effective limit**: We use 7500 bytes (`CHUNK_MAX_BYTES`) for safety margin
+**IMPORTANT**: The limits differ by mode. Freeform multi-speaker is the most
+restrictive — it is NOT 8000 bytes.
+
+* **Freeform multi-speaker (our mode)**: 4000 bytes for dialogue text
+* **Single-speaker Gemini TTS**: text ≤ 4000 + prompt ≤ 4000, combined ≤ 8000
+* **Structured MultiSpeakerMarkup**: markup ≤ 4000 + prompt ≤ 4000, combined ≤ 8000
+* **Vertex AI API**: 8000 bytes unified (contents field)
+* **Effective limit**: We use 3500 bytes (`CHUNK_MAX_BYTES`) for safety margin
 * **Freeform overhead**: Each turn adds `"Speaker: "` prefix + newline, so
   `freeform_bytes > input_bytes` (raw dialogue text)
 * **Chunking**: Splits at turn boundaries. Each chunk gets the full prompt and
