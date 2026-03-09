@@ -12,6 +12,7 @@
 import argparse
 import json
 import re
+import struct
 import sys
 import os
 import time
@@ -75,12 +76,12 @@ Errors and warnings go to stderr.
 All output is machine-readable JSONL (one JSON object per line) on stdout.
 Each line has an "event" field. Events emitted:
 
-    {"event":"parsed","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"voice_map":{"Teacher":"Orus","Student":"Aoede"}}
+    {"event":"parsed","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"freeform_bytes":455,"prompt_bytes":42,"total_api_bytes":497,"api_limit_bytes":8000,"voice_map":{"Teacher":"Orus","Student":"Aoede"}}
     {"event":"generating","model":"gemini-2.5-flash-tts","language":"en-US","encoding":"MP3","prompt":"..."}
     {"event":"completed","output_file":"out.mp3","audio_bytes":96288,"duration_seconds":1.23}
     {"event":"dry_run","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"voice_map":{"Teacher":"Orus","Student":"Aoede"},"output_file":"out.mp3"}
     {"event":"skipped","output_file":"out.mp3","reason":"already_exists"}
-    {"event":"warning","message":"Input text is ~9000 bytes, Gemini TTS limit is ~8000 bytes"}
+    {"event":"warning","message":"Estimated API payload is ~9000 bytes (text:8500 + prompt:500), Gemini TTS limit is ~8000 bytes. Request may fail. See: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers"}
     {"event":"error","message":"2 speakers found but only 1 voices specified with --voices"}
 
 Errors in JSONL mode are also printed as JSONL to stdout (not stderr) and
@@ -108,6 +109,26 @@ MP3 (default), WAV/LINEAR16, OGG/OGG_OPUS, MULAW, ALAW
 ## Models
 - gemini-2.5-flash-tts (default) — fast, cost-efficient
 - gemini-2.5-pro-tts — higher quality, better for podcasts/audiobooks
+
+## Input Size Limits
+- Standard Cloud TTS v1: 5000 bytes (text or SSML)
+- Gemini TTS: 8000 bytes combined (text + prompt fields)
+  Note: the freeform text includes "Speaker: " prefixes per turn, which add
+  to the byte count beyond the raw dialogue text.
+- Output audio: ~655 seconds max duration (truncated if exceeded)
+- Source: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
+  (see also: REST API ref at /rest/v1/text/synthesize for v1 limits)
+
+## Chunked Generation (--chunk)
+When input exceeds the ~8000 byte API limit, use --chunk to automatically split
+the dialogue into multiple API calls and concatenate the audio output.
+- Splits only at turn boundaries (never mid-sentence)
+- Each chunk includes all speaker voice configs (for voice consistency)
+- The prompt is sent with every chunk (for style consistency)
+- MP3 output recommended for cleanest chunk concatenation
+- WAV also supported (headers are properly merged)
+- Dry run (-n) reports chunk count even without --chunk enabled
+- JSONL events include chunk/total_chunks fields per API call
 
 ## Style Prompts (--prompt)
 Natural language instructions controlling delivery style. Examples:
@@ -142,6 +163,11 @@ Markup tags can be used in the dialogue text itself: [sigh], [whispering],
             error)     echo "FAIL: $(echo "$line" | jq -r .message)" >&2 ;;
           esac
         done
+
+### Long dialogue with chunking:
+    uv run multi-speaker_markup_from_dialog_transcript.py \
+      -i long_dialogue.txt --chunk --voices Charon,Kore \
+      -p "Lively debate between colleagues"
 
 ### Dry run (no API call):
     uv run multi-speaker_markup_from_dialog_transcript.py \
@@ -258,11 +284,97 @@ def list_voices():
         print(f"  {voice.name}  ({lang_codes}, {gender})")
 
 
-def generate_audio(turns, speakers_seen):
+# Gemini TTS combined limit: 8000 bytes (text + prompt)
+# Use 7500 as effective limit for safety margin
+# Source: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
+CHUNK_MAX_BYTES = 7500
+
+
+def freeform_line_bytes(speaker, text):
+    """Byte length of a single freeform line 'Speaker: text'."""
+    return len(f"{speaker}: {text}".encode('utf-8'))
+
+
+def chunk_turns(turns, prompt_bytes):
+    """Split turns into chunks that each fit within the Gemini TTS byte limit.
+
+    Each chunk is a list of (speaker, text) tuples. Splits only at turn
+    boundaries — never mid-turn. Returns list of chunk lists.
+    """
+    max_text_bytes = CHUNK_MAX_BYTES - prompt_bytes
+    if max_text_bytes <= 0:
+        emit_error(f"Prompt alone is {prompt_bytes} bytes, exceeds chunk limit of {CHUNK_MAX_BYTES}")
+
+    chunks = []
+    current_chunk = []
+    current_bytes = 0
+
+    for speaker, text in turns:
+        line_bytes = freeform_line_bytes(speaker, text)
+        # +1 for newline separator between lines (except first in chunk)
+        added_bytes = line_bytes + (1 if current_chunk else 0)
+
+        if current_bytes + added_bytes > max_text_bytes and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_bytes = 0
+            added_bytes = line_bytes  # first in new chunk, no newline prefix
+
+        if line_bytes > max_text_bytes:
+            emit_warning(f"Single turn by '{speaker}' is {line_bytes} bytes, exceeds chunk limit of {max_text_bytes}. "
+                         f"It will be sent as its own chunk and may fail.")
+
+        current_chunk.append((speaker, text))
+        current_bytes += added_bytes
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def concatenate_audio(audio_parts, audio_encoding):
+    """Concatenate audio chunks, handling format-specific requirements.
+
+    MP3: frames are self-contained, direct concatenation works.
+    WAV/LINEAR16: strip 44-byte WAV headers from chunks 2+, fix final header.
+    Others: direct concatenation with warning about potential artifacts.
+    """
+    if len(audio_parts) == 1:
+        return audio_parts[0]
+
+    if audio_encoding == texttospeech.AudioEncoding.MP3:
+        return b"".join(audio_parts)
+
+    if audio_encoding == texttospeech.AudioEncoding.LINEAR16:
+        # WAV format: 44-byte header + PCM data
+        # Keep header from first chunk, strip from subsequent
+        WAV_HEADER_SIZE = 44
+        pcm_data = audio_parts[0]  # first chunk has complete WAV with header
+        for part in audio_parts[1:]:
+            if len(part) > WAV_HEADER_SIZE:
+                pcm_data += part[WAV_HEADER_SIZE:]
+            else:
+                pcm_data += part
+        # Fix WAV header: update ChunkSize (bytes 4-7) and Subchunk2Size (bytes 40-43)
+        data_size = len(pcm_data) - WAV_HEADER_SIZE
+        pcm_data = bytearray(pcm_data)
+        struct.pack_into('<I', pcm_data, 4, data_size + 36)  # ChunkSize = DataSize + 36
+        struct.pack_into('<I', pcm_data, 40, data_size)      # Subchunk2Size = DataSize
+        return bytes(pcm_data)
+
+    # OGG_OPUS, MULAW, ALAW: best-effort concatenation
+    emit_warning(f"Chunked concatenation for this encoding may produce artifacts at chunk boundaries. "
+                 f"Consider using MP3 or WAV with --chunk for cleanest results.")
+    return b"".join(audio_parts)
+
+
+def generate_audio(turns, speakers_seen, voice_map=None):
     """Generate multi-speaker audio using Gemini TTS."""
     client = texttospeech.TextToSpeechClient()
 
-    voice_map = build_voice_map(speakers_seen)
+    if voice_map is None:
+        voice_map = build_voice_map(speakers_seen)
     for speaker, voice_id in voice_map.items():
         log_verbose("DEB:VOICE_MAP[{}] = {}", speaker, voice_id)
 
@@ -329,6 +441,48 @@ def generate_audio(turns, speakers_seen):
     return response.audio_content, elapsed
 
 
+def generate_audio_chunked(turns, speakers_seen):
+    """Generate audio in chunks when input exceeds API byte limit.
+
+    Splits turns into chunks, makes separate API calls, and concatenates
+    the resulting audio. The prompt and voice config are shared across all chunks.
+    """
+    prompt_bytes = len(args.prompt.encode('utf-8')) if args.prompt else 0
+    chunks = chunk_turns(turns, prompt_bytes)
+    voice_map = build_voice_map(speakers_seen)
+    audio_encoding = choose_audio_encoding()
+    encoding_str = next(key for key, value in encoding_map.items() if value == audio_encoding)
+
+    log_verbose("DEB:Chunking: {} turns split into {} chunks (limit: {} bytes, prompt: {} bytes)",
+                len(turns), len(chunks), CHUNK_MAX_BYTES, prompt_bytes)
+
+    audio_parts = []
+    total_elapsed = 0
+
+    for i, chunk_turns_list in enumerate(chunks):
+        chunk_text_bytes = sum(freeform_line_bytes(s, t) for s, t in chunk_turns_list) + max(len(chunk_turns_list) - 1, 0)
+        log_verbose("DEB:Chunk {}/{}: {} turns, ~{} text bytes",
+                    i + 1, len(chunks), len(chunk_turns_list), chunk_text_bytes)
+
+        emit({"event": "generating", "model": args.model, "language": args.language,
+              "encoding": encoding_str, "prompt": args.prompt,
+              "chunk": i + 1, "total_chunks": len(chunks),
+              "chunk_turns": len(chunk_turns_list), "chunk_bytes": chunk_text_bytes})
+
+        audio_content, elapsed = generate_audio(chunk_turns_list, speakers_seen, voice_map=voice_map)
+        audio_parts.append(audio_content)
+        total_elapsed += elapsed
+
+        log_verbose("DEB:Chunk {}/{}: {} audio bytes, {:.2f}s",
+                    i + 1, len(chunks), len(audio_content), elapsed)
+
+    combined = concatenate_audio(audio_parts, audio_encoding)
+    log_verbose("DEB:Combined {} chunks: {} total audio bytes, {:.2f}s total",
+                len(chunks), len(combined), total_elapsed)
+
+    return combined, total_elapsed
+
+
 encoding_map = {
     "LINEAR16": texttospeech.AudioEncoding.LINEAR16,
     "WAV": texttospeech.AudioEncoding.LINEAR16,
@@ -390,6 +544,10 @@ def main():
                              "handset-class-device, telephony-class-application, etc.")
 
     # Modes
+    parser.add_argument("--chunk", action="store_true",
+                        help="Enable chunked generation for long dialogues that exceed the ~8000 byte "
+                             "API limit. Splits at turn boundaries, makes multiple API calls, and "
+                             "concatenates the audio. Without this flag, oversized input produces a warning.")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Parse input and show plan without calling the API")
     parser.add_argument("-v", "--verbose", action="count", default=0,
@@ -453,14 +611,33 @@ def main():
     if args.prompt:
         log_verbose("DEB:Prompt: {}", args.prompt)
 
-    if input_bytes > 8000:
-        emit_warning(f"Input text is ~{input_bytes} bytes, Gemini TTS limit is ~8000 bytes (prompt+text). Request may fail.")
+    # Gemini TTS combined limit: 8000 bytes (text + prompt)
+    # Source: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
+    # Note: freeform_text includes "Speaker: " prefixes per turn, so actual API payload > input_bytes
+    freeform_bytes = sum(len(f"{spk}: {txt}".encode('utf-8')) for spk, txt in turns) + len(turns) - 1  # newlines
+    prompt_bytes = len(args.prompt.encode('utf-8')) if args.prompt else 0
+    total_api_bytes = freeform_bytes + prompt_bytes
+    needs_chunking = total_api_bytes > CHUNK_MAX_BYTES
+    if needs_chunking and not args.chunk:
+        emit_warning(f"Estimated API payload is ~{total_api_bytes} bytes (text:{freeform_bytes} + prompt:{prompt_bytes}), "
+                     f"Gemini TTS limit is ~8000 bytes. Request may fail. "
+                     f"Use --chunk to automatically split into multiple API calls. "
+                     f"See: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers")
+
+    # Compute chunk plan for reporting (even if --chunk not set)
+    chunk_count = len(chunk_turns(turns, prompt_bytes)) if needs_chunking else 1
 
     parsed_info = {
         "event": "parsed",
         "turns": len(turns),
         "speakers": speakers_seen,
         "input_bytes": input_bytes,
+        "freeform_bytes": freeform_bytes,
+        "prompt_bytes": prompt_bytes,
+        "total_api_bytes": total_api_bytes,
+        "api_limit_bytes": 8000,
+        "chunks_needed": chunk_count,
+        "chunking_enabled": args.chunk,
         "voice_map": voice_map,
     }
     emit(parsed_info)
@@ -477,31 +654,50 @@ def main():
         if args.jsonl:
             emit(dry_info)
         else:
-            print(f"Dry run: {len(turns)} turns, {len(speakers_seen)} speakers, ~{input_bytes} bytes")
+            print(f"Dry run: {len(turns)} turns, {len(speakers_seen)} speakers, ~{total_api_bytes} API bytes")
             print(f"  Model: {args.model}  Language: {args.language}")
             for speaker, voice_id in voice_map.items():
                 print(f"  {speaker} -> {voice_id}")
             if args.prompt:
                 print(f"  Prompt: {args.prompt}")
+            if chunk_count > 1:
+                chunk_label = f"  Chunks: {chunk_count} API calls" + (" (--chunk enabled)" if args.chunk else " (needs --chunk flag)")
+                print(chunk_label)
             print(f"  Output would be: {output_file}")
         return
 
-    log_verbose("Generating audio")
-    audio_content, elapsed = generate_audio(turns, speakers_seen)
+    use_chunking = args.chunk and needs_chunking
+    if args.chunk and not needs_chunking:
+        log_verbose("DEB:--chunk specified but input fits in single request ({} bytes <= {} limit), skipping chunking",
+                    total_api_bytes, CHUNK_MAX_BYTES)
+
+    if use_chunking:
+        log_verbose("Generating audio in chunks (input ~{} bytes exceeds {} limit)", total_api_bytes, CHUNK_MAX_BYTES)
+        audio_content, elapsed = generate_audio_chunked(turns, speakers_seen)
+    else:
+        log_verbose("Generating audio")
+        audio_content, elapsed = generate_audio(turns, speakers_seen)
 
     log_verbose("Writing audio to {}", output_file)
     with open(output_file, "wb") as out:
         out.write(audio_content)
 
+    completed_info = {
+        "event": "completed",
+        "output_file": output_file,
+        "audio_bytes": len(audio_content),
+        "duration_seconds": round(elapsed, 2),
+    }
+    if use_chunking:
+        completed_info["chunks"] = chunk_count
+
     if args.jsonl:
-        emit({
-            "event": "completed",
-            "output_file": output_file,
-            "audio_bytes": len(audio_content),
-            "duration_seconds": round(elapsed, 2),
-        })
+        emit(completed_info)
     else:
-        print(f'Audio content written to file "{output_file}"')
+        msg = f'Audio content written to file "{output_file}"'
+        if use_chunking:
+            msg += f" ({chunk_count} chunks concatenated)"
+        print(msg)
 
 
 if __name__ == "__main__":
