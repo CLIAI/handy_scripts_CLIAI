@@ -97,6 +97,8 @@ def generate_audio(turns):
         audio_config_kwargs["speaking_rate"] = args.rate
     if args.pitch is not None:
         audio_config_kwargs["pitch"] = args.pitch
+    if args.volume is not None:
+        audio_config_kwargs["volume_gain_db"] = args.volume
     if args.sample_rate is not None:
         audio_config_kwargs["sample_rate_hertz"] = args.sample_rate
     if args.audio_profile:
@@ -113,25 +115,20 @@ def generate_audio(turns):
 
 encoding_map = {
     "LINEAR16": texttospeech.AudioEncoding.LINEAR16,
+    "WAV": texttospeech.AudioEncoding.LINEAR16,
     "MP3": texttospeech.AudioEncoding.MP3,
     "OGG_OPUS": texttospeech.AudioEncoding.OGG_OPUS,
+    "OGG": texttospeech.AudioEncoding.OGG_OPUS,
     "MULAW": texttospeech.AudioEncoding.MULAW,
     "ALAW": texttospeech.AudioEncoding.ALAW,
-    # "FLAC": texttospeech.AudioEncoding.FLAC,  # FLAC is not yet supported: https://github.com/googleapis/google-cloud-python/issues/13239
-    "wav": texttospeech.AudioEncoding.LINEAR16,
-    "mp3": texttospeech.AudioEncoding.MP3,
-    "ogg": texttospeech.AudioEncoding.OGG_OPUS,
-    "OGG": texttospeech.AudioEncoding.OGG_OPUS,
-    "mulaw": texttospeech.AudioEncoding.MULAW,
-    "alaw": texttospeech.AudioEncoding.ALAW,
-    # "flac": texttospeech.AudioEncoding.FLAC,  # FLAC is not yet supported: https://github.com/googleapis/google-cloud-python/issues/13239
-    "WAV": texttospeech.AudioEncoding.LINEAR16,
+    # "FLAC": texttospeech.AudioEncoding.FLAC,  # not yet supported: https://github.com/googleapis/google-cloud-python/issues/13239
 }
 
 def get_audio_encoding(encoding_str):
     encoding = encoding_map.get(encoding_str.upper())
     if encoding is None:
-        print(f"ERROR: Unsupported audio encoding '{encoding_str.upper()}'", file=sys.stderr)
+        valid = ", ".join(sorted(set(encoding_map.keys())))
+        print(f"ERROR: Unsupported audio encoding '{encoding_str}'. Valid: {valid}", file=sys.stderr)
         sys.exit(1)
     return encoding
 
@@ -139,15 +136,17 @@ def main():
     global args
     parser = argparse.ArgumentParser(description="Generate multi-speaker audio from input text.")
     parser.add_argument("-i", "--input", default=None, help="Input file (use '-' for stdin)")
-    parser.add_argument("-s", "--speakers", default="R,S,T,U", help="Speaker mapping (comma-separated) [R,S,T,U]")
+    parser.add_argument("-s", "--speakers", default="R,S,T,U,V,W,X,Y", help="Speaker mapping (comma-separated, up to 8) [R,S,T,U,V,W,X,Y]")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable verbose logging")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Run the script without generating or writing audio")
     parser.add_argument("-e", "--encoding", default=None, help="Audio encoding (wav, mp3, ogg, mulaw, alaw)")
     parser.add_argument("-o", "--output", default=None, help="Output file (default is input filename with appropriate extension)")
+    parser.add_argument("-f", "--force", action="store_true", help="Overwrite output file if it already exists")
     parser.add_argument("-l", "--language", default="en-US", help="Language code (default: en-US)")
     parser.add_argument("--voice-name", default=None, help="Voice name (default: {language}-Studio-MultiSpeaker)")
     parser.add_argument("--rate", type=float, default=None, help="Speaking rate 0.25-4.0 (default: 1.0)")
     parser.add_argument("--pitch", type=float, default=None, help="Pitch in semitones -20.0 to 20.0 (default: 0.0)")
+    parser.add_argument("--volume", type=float, default=None, help="Volume gain in dB -96.0 to 16.0 (default: 0.0, recommend max +10)")
     parser.add_argument("--sample-rate", type=int, default=None, help="Sample rate in Hz (e.g. 16000, 24000, 48000)")
     parser.add_argument("--audio-profile", action="append", default=None,
                         help="Audio device profile (can be repeated). Options: "
@@ -170,23 +169,36 @@ def main():
 
     args.speakers = args.speakers.split(',')
 
-    input_file = sys.stdin if args.input == '-' else open(args.input, 'r')
     if args.input == '-':
-        output_file = "output.mp3" if not args.output else args.output
-    elif args.output:
-        output_file = args.output
-        if not args.encoding:
-            args.encoding = os.path.splitext(output_file)[1][1:]
+        input_file = sys.stdin
+        output_file = args.output if args.output else "output.mp3"
     else:
-        output_file = args.input + "." + args.encoding if args.encoding else ".mp3"
+        input_file = open(args.input, 'r')
+        if args.output:
+            output_file = args.output
+            if not args.encoding:
+                args.encoding = os.path.splitext(output_file)[1][1:]
+        else:
+            ext = args.encoding if args.encoding else "mp3"
+            output_file = args.input + "." + ext
 
-    if os.path.exists(output_file):
-        print(f"SKIPPING:ALREADY_EXISTS:{output_file}")
+    if not args.force and os.path.exists(output_file):
+        print(f"SKIPPING:ALREADY_EXISTS:{output_file} (use --force to overwrite)", file=sys.stderr)
         sys.exit(1)
 
     log_verbose(f"Processing input from {args.input}")
-    turns = parse_input(input_file)
-    
+    try:
+        turns = parse_input(input_file)
+    finally:
+        if input_file is not sys.stdin:
+            input_file.close()
+
+    input_bytes = sum(len(t.text.encode('utf-8')) for t in turns)
+    log_verbose("DEB:Parsed {} turns from {} speakers, ~{} bytes of text", len(turns), len(set(t.speaker for t in turns)), input_bytes)
+
+    if input_bytes > 5000:
+        print(f"WARNING: Input text is ~{input_bytes} bytes, API limit is 5000 bytes. Request may fail.", file=sys.stderr)
+
     if not args.dry_run:
         log_verbose("Generating audio")
         audio_content = generate_audio(turns)
@@ -200,33 +212,7 @@ def main():
         audio_encoding = choose_audio_encoding()
         encoding_str = next(key for key, value in encoding_map.items() if value == audio_encoding)
         log_verbose("DEB:Chosen audio encoding: {}", encoding_str)
-        print(f"Dry run completed. No audio would have been written to {output_file}")
+        print(f"Dry run: {len(turns)} turns, ~{input_bytes} bytes. Output would be: {output_file}")
 
 if __name__ == "__main__":
     main()
-
-# This script does the following:
-# 
-# 1. It uses argparse to handle command-line arguments, including -i/--input, --speakers, -v/--verbose, and -n/--dry-run.
-# 2. It reads the input file (or stdin if '-' is specified) and parses it into a list of turns.
-# 3. It maps the first four encountered speakers to the specified speaker names (default R,S,T,U).
-# 4. It generates the audio using the Google Cloud Text-to-Speech API.
-# 5. It checks if the output file already exists before writing, and exits with an error if it does.
-# 6. It writes the generated audio to the output file.
-# 7. It includes verbose logging when the -v flag is used.
-# 8. It includes a dry-run mode that runs the script without generating or writing audio when the -n flag is used.
-# 
-# To use this script, you would run it like this:
-# 
-# ```
-# python3 script.py -i input.txt
-# ```
-# 
-# Or with custom speakers, verbose logging, and dry-run mode:
-# 
-# ```
-# python3 script.py -i input.txt --speakers A,B,C,D -v -n
-# ```
-# 
-# Make sure you have the Google Cloud Text-to-Speech client library installed (`pip install google-cloud-texttospeech`) and that you have set up your Google Cloud credentials before running the script.
-# 
