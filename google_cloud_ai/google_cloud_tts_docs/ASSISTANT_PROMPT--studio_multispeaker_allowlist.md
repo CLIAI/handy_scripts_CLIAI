@@ -15,6 +15,10 @@ Currently we get this error when calling the API:
 
 * The `en-US-Studio-MultiSpeaker` voice allows generating dialogue audio with
   up to 8 distinct speakers (designators R through Y) in a single API call.
+  - Note: `en-US` in the voice name is a **language/accent code** (English,
+    American accent) — not a datacenter region. This is a BCP-47 locale tag.
+    The voice is only available in English (US accent) currently; other
+    languages like `de-DE` or `fr-FR` do not have a Studio MultiSpeaker variant.
 * It was launched October 30, 2024 and is still classified as **Experimental**.
 * There is **no self-service form, Console toggle, or API flag** to enable it.
 * The only documented path is contacting Google Cloud Sales.
@@ -54,7 +58,7 @@ allowlisted proves difficult, we have a working fallback.
 | Feature | Studio MultiSpeaker | Gemini TTS (Flash/Pro) |
 |---------|---------------------|------------------------|
 | Status | Experimental (allowlist) | GA (no restrictions) |
-| Languages | en-US only | 21 GA + 65 preview |
+| Languages | English (US accent) only | 21 GA languages + 65 preview |
 | Max speakers | 8 per call | 2 per call |
 | Voice control | SSML (deterministic) | Natural language prompts (stochastic) |
 | Streaming | No | Yes |
