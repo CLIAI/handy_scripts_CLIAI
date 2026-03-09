@@ -55,5 +55,12 @@ htmlcov/
 *.swo
 *~
 
+# Generated audio files (TTS output)
+*.mp3
+*.wav
+*.ogg
+*.opus
+*.flac
+
 # Benchmark results
 evals/speaker_mapper/results/
