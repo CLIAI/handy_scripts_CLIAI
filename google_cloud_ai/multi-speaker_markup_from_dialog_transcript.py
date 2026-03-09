@@ -12,7 +12,9 @@
 import argparse
 import json
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import os
 import time
@@ -66,9 +68,26 @@ Student: Einen Kaffee, bitte!
 
 ## Output Formats
 
-### Default (human-readable)
-Writes audio file and prints status to stdout:
-    Audio content written to file "output.mp3"
+### Default behavior (3 files)
+By default (no -e flag), the tool:
+1. Requests lossless WAV (LINEAR16) from the API
+2. Saves the .wav file
+3. Transcodes locally via ffmpeg to:
+   - .ogg (Opus VBR ~96kbps — excellent quality for speech)
+   - .mp3 (LAME VBR V2 ~190kbps — high quality, widely compatible)
+
+This produces 3 files with the same base name. The API's MP3 is only 32kbps,
+so local transcoding from lossless WAV yields much better compressed output.
+
+Requires ffmpeg installed. If missing, only .wav is produced (with warning).
+Use --no-transcode to explicitly skip transcoding (WAV only).
+Use -e to request a single specific format from the API directly.
+
+### Human-readable output
+Writes audio file(s) and prints status to stdout:
+    Audio written to "output.wav"
+      + transcoded: "output.ogg" (12345 bytes, ogg)
+      + transcoded: "output.mp3" (23456 bytes, mp3)
 
 Errors and warnings go to stderr.
 
@@ -77,10 +96,10 @@ All output is machine-readable JSONL (one JSON object per line) on stdout.
 Each line has an "event" field. Events emitted:
 
     {"event":"parsed","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"freeform_bytes":455,"prompt_bytes":42,"total_api_bytes":497,"api_limit_bytes":8000,"voice_map":{"Teacher":"Orus","Student":"Aoede"}}
-    {"event":"generating","model":"gemini-2.5-flash-tts","language":"en-US","encoding":"MP3","prompt":"..."}
-    {"event":"completed","output_file":"out.mp3","audio_bytes":96288,"duration_seconds":1.23}
-    {"event":"dry_run","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"voice_map":{"Teacher":"Orus","Student":"Aoede"},"output_file":"out.mp3"}
-    {"event":"skipped","output_file":"out.mp3","reason":"already_exists"}
+    {"event":"generating","model":"gemini-2.5-flash-tts","language":"en-US","encoding":"LINEAR16","prompt":"..."}
+    {"event":"completed","output_files":["out.wav","out.ogg","out.mp3"],"primary_file":"out.wav","audio_bytes":96288,"duration_seconds":1.23,"transcoded":[{"file":"out.ogg","format":"ogg","bytes":12345},{"file":"out.mp3","format":"mp3","bytes":23456}]}
+    {"event":"dry_run","turns":6,"speakers":["Teacher","Student"],"input_bytes":335,"voice_map":{"Teacher":"Orus","Student":"Aoede"},"output_files":["out.wav","out.ogg","out.mp3"],"transcode":true}
+    {"event":"skipped","output_file":"out.wav","reason":"already_exists"}
     {"event":"warning","message":"Estimated API payload is ~9000 bytes (text:8500 + prompt:500), Gemini TTS limit is ~8000 bytes. Request may fail. See: https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers"}
     {"event":"error","message":"2 speakers found but only 1 voices specified with --voices"}
 
@@ -115,8 +134,10 @@ determined entirely by the encoding format choice (-e flag):
 | MULAW     | mulaw   | Telephony   | 8-bit G.711 mu-law                             |
 | ALAW      | alaw    | Telephony   | 8-bit G.711 A-law. NOT supported by Chirp 3 HD |
 
-RECOMMENDATION: Use ogg (-e ogg) for quality, wav (-e wav) for post-processing.
-MP3 is default for compatibility but 32kbps is low for speech.
+DEFAULT BEHAVIOR: Requests lossless WAV from API, then transcodes locally via
+ffmpeg to .ogg (Opus VBR ~96kbps) and .mp3 (LAME VBR V2 ~190kbps) — 3 files.
+Use -e to request a single format from API directly (skips local transcoding).
+Use --no-transcode to get just the WAV.
 
 The complete AudioConfig parameter set (this is ALL the API exposes):
 - audioEncoding — format (see table above)
@@ -178,13 +199,21 @@ Markup tags can be used in the dialogue text itself: [sigh], [whispering],
 
 ## Usage Examples
 
-### Basic generation:
+### Basic generation (produces .wav + .ogg + .mp3):
     uv run multi-speaker_markup_from_dialog_transcript.py -i dialogue.txt
 
-### Custom voices + style prompt:
+### Custom voices + style prompt (3 files):
     uv run multi-speaker_markup_from_dialog_transcript.py \
       -i dialogue.txt --voices Charon,Kore \
       -p "Fun lighthearted banter between friends"
+
+### Single format from API directly (no local transcoding):
+    uv run multi-speaker_markup_from_dialog_transcript.py \
+      -i dialogue.txt -e ogg -o output.ogg
+
+### WAV only (no transcoding):
+    uv run multi-speaker_markup_from_dialog_transcript.py \
+      -i dialogue.txt --no-transcode
 
 ### German dialogue:
     uv run multi-speaker_markup_from_dialog_transcript.py \
@@ -333,7 +362,10 @@ def build_voice_map(speakers_seen):
 
 
 def choose_audio_encoding():
-    return get_audio_encoding(args.encoding) if args.encoding else texttospeech.AudioEncoding.MP3
+    if args.encoding:
+        return get_audio_encoding(args.encoding)
+    # Default: WAV (lossless) — local transcoding to ogg+mp3 handles compression
+    return texttospeech.AudioEncoding.LINEAR16
 
 
 def list_voices():
@@ -435,6 +467,55 @@ def concatenate_audio(audio_parts, audio_encoding):
     emit_warning(f"Chunked concatenation for this encoding may produce artifacts at chunk boundaries. "
                  f"Consider using MP3 or WAV with --chunk for cleanest results.")
     return b"".join(audio_parts)
+
+
+def check_ffmpeg():
+    """Check if ffmpeg is available, return path or None."""
+    return shutil.which("ffmpeg")
+
+
+def transcode_wav(wav_path, output_base):
+    """Transcode WAV to high-quality OGG (Opus VBR) and MP3 (LAME VBR).
+
+    Returns list of (format, path, size) for files created.
+    """
+    ffmpeg = check_ffmpeg()
+    if not ffmpeg:
+        emit_warning("ffmpeg not found — skipping local transcoding to .ogg and .mp3. "
+                     "Install ffmpeg for automatic high-quality compression.")
+        return []
+
+    results = []
+    transcode_specs = [
+        # (extension, codec, quality args, description)
+        (".ogg", "libopus", ["-b:a", "96k", "-vbr", "on"], "Opus VBR ~96kbps"),
+        (".mp3", "libmp3lame", ["-q:a", "2"], "LAME VBR V2 ~190kbps"),
+    ]
+
+    for ext, codec, quality_args, description in transcode_specs:
+        out_path = output_base + ext
+        if not args.force and os.path.exists(out_path):
+            log_verbose("DEB:Transcode: skipping {} (already exists)", out_path)
+            emit_warning(f"Transcode target {out_path} already exists, skipping (use --force)")
+            continue
+
+        cmd = [ffmpeg, "-y", "-i", wav_path, "-c:a", codec] + quality_args + [out_path]
+        log_verbose("DEB:Transcode: {} → {} ({})", wav_path, out_path, description)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                emit_warning(f"ffmpeg transcode to {ext} failed: {result.stderr.strip()[-200:]}")
+                continue
+            size = os.path.getsize(out_path)
+            results.append((ext, out_path, size))
+            log_verbose("DEB:Transcode: {} → {} bytes", out_path, size)
+        except subprocess.TimeoutExpired:
+            emit_warning(f"ffmpeg transcode to {ext} timed out after 120s")
+        except OSError as e:
+            emit_warning(f"ffmpeg transcode to {ext} failed: {e}")
+
+    return results
 
 
 def generate_audio(turns, speakers_seen, voice_map=None):
@@ -574,24 +655,29 @@ def main():
     global args
     parser = argparse.ArgumentParser(
         description="Generate multi-speaker dialogue audio using Gemini TTS. "
-                    "For best quality use -e ogg (OGG_OPUS). Default mp3 is only 32kbps. "
+                    "By default requests lossless WAV from the API and locally transcodes "
+                    "to high-quality .ogg (Opus VBR ~96kbps) and .mp3 (LAME VBR V2 ~190kbps), "
+                    "producing 3 files. Use -e to request a single format from the API directly. "
                     "Use --help-llm for full reference with official doc links.",
-        epilog="Example: %(prog)s -i dialogue.txt -e ogg --voices Charon,Kore -p 'Friendly conversation'",
+        epilog="Example: %(prog)s -i dialogue.txt --voices Charon,Kore -p 'Friendly conversation'",
     )
 
     # I/O
     parser.add_argument("-i", "--input", default=None,
                         help="Input file with 'Speaker: text' format (use '-' for stdin)")
     parser.add_argument("-o", "--output", default=None,
-                        help="Output audio file path (default: input filename + .mp3)")
+                        help="Output file path or base name. Default mode (no -e): this sets the base "
+                             "name for .wav/.ogg/.mp3 (extension is stripped). With -e: exact output path.")
     parser.add_argument("-f", "--force", action="store_true",
-                        help="Overwrite output file if it already exists")
+                        help="Overwrite output files if they already exist")
     parser.add_argument("-e", "--encoding", default=None,
-                        help="Audio encoding: mp3 (default, 32kbps fixed — low quality), "
-                             "ogg (OGG_OPUS — best lossy quality, recommended), "
-                             "wav (LINEAR16 lossless, largest files), "
-                             "mulaw, alaw (telephony). "
-                             "Note: API provides NO bitrate control — quality depends on format choice.")
+                        help="Request a SINGLE format from the API directly (disables local transcoding). "
+                             "Options: mp3 (API 32kbps fixed), ogg (OGG_OPUS), wav (LINEAR16 lossless), "
+                             "mulaw, alaw. Without -e, default behavior requests lossless WAV and locally "
+                             "transcodes to high-quality .ogg + .mp3 via ffmpeg (3 files).")
+    parser.add_argument("--no-transcode", action="store_true",
+                        help="Get lossless WAV from API but skip local transcoding to .ogg/.mp3 "
+                             "(produces only the .wav file). Useful if ffmpeg is unavailable.")
 
     # TTS config
     parser.add_argument("-l", "--language", default="en-US",
@@ -653,19 +739,34 @@ def main():
     if args.input is None:
         parser.error("the following arguments are required: -i/--input")
 
+    # Determine if we're in single-format mode (-e) or multi-output mode (default)
+    single_format = args.encoding is not None
+    do_transcode = not single_format and not args.no_transcode
+
     if args.input == '-':
         input_file = sys.stdin
-        output_file = args.output if args.output else "output.mp3"
+        if args.output:
+            output_base = os.path.splitext(args.output)[0]
+        else:
+            output_base = "output"
     else:
         input_file = open(args.input, 'r')
         if args.output:
-            output_file = args.output
-            if not args.encoding:
-                args.encoding = os.path.splitext(output_file)[1][1:]
+            output_base = os.path.splitext(args.output)[0]
         else:
-            ext = args.encoding if args.encoding else "mp3"
-            output_file = args.input + "." + ext
+            output_base = args.input
 
+    if single_format:
+        # Single format from API: use -e extension
+        ext = args.encoding.lower()
+        if ext in ("linear16", "ogg_opus"):
+            ext = {"linear16": "wav", "ogg_opus": "ogg"}[ext]
+        output_file = output_base + "." + ext
+    else:
+        # Default: WAV from API (+ local transcode to ogg/mp3)
+        output_file = output_base + ".wav"
+
+    # Check if primary output exists
     if not args.force and os.path.exists(output_file):
         if args.jsonl:
             emit({"event": "skipped", "output_file": output_file, "reason": "already_exists"})
@@ -724,13 +825,18 @@ def main():
     emit(parsed_info)
 
     if args.dry_run:
+        output_files = [output_file]
+        if do_transcode:
+            output_files += [output_base + ".ogg", output_base + ".mp3"]
+
         dry_info = {
             **parsed_info,
             "event": "dry_run",
             "model": args.model,
             "language": args.language,
             "prompt": args.prompt,
-            "output_file": output_file,
+            "output_files": output_files,
+            "transcode": do_transcode,
         }
         if args.jsonl:
             emit(dry_info)
@@ -744,7 +850,12 @@ def main():
             if chunk_count > 1:
                 chunk_label = f"  Chunks: {chunk_count} API calls" + (" (--chunk enabled)" if args.chunk else " (needs --chunk flag)")
                 print(chunk_label)
-            print(f"  Output would be: {output_file}")
+            if do_transcode:
+                print(f"  Output (3 files): {output_base}.wav / .ogg / .mp3")
+                if not check_ffmpeg():
+                    print(f"  WARNING: ffmpeg not found — .ogg and .mp3 will be skipped")
+            else:
+                print(f"  Output: {output_file}")
         return
 
     use_chunking = args.chunk and needs_chunking
@@ -763,22 +874,37 @@ def main():
     with open(output_file, "wb") as out:
         out.write(audio_content)
 
+    output_files = [{"file": output_file, "format": "wav" if not single_format else args.encoding,
+                     "bytes": len(audio_content), "source": "api"}]
+
+    # Local transcoding (default mode: WAV → OGG + MP3)
+    if do_transcode:
+        log_verbose("Transcoding WAV to OGG and MP3 via ffmpeg")
+        transcode_results = transcode_wav(output_file, output_base)
+        for ext, path, size in transcode_results:
+            output_files.append({"file": path, "format": ext.lstrip("."), "bytes": size, "source": "ffmpeg"})
+
     completed_info = {
         "event": "completed",
-        "output_file": output_file,
+        "output_files": [f["file"] for f in output_files],
+        "primary_file": output_file,
         "audio_bytes": len(audio_content),
         "duration_seconds": round(elapsed, 2),
     }
     if use_chunking:
         completed_info["chunks"] = chunk_count
+    if do_transcode:
+        completed_info["transcoded"] = [{"file": f["file"], "format": f["format"], "bytes": f["bytes"]}
+                                        for f in output_files if f["source"] == "ffmpeg"]
 
     if args.jsonl:
         emit(completed_info)
     else:
-        msg = f'Audio content written to file "{output_file}"'
-        if use_chunking:
-            msg += f" ({chunk_count} chunks concatenated)"
-        print(msg)
+        chunk_note = f" ({chunk_count} chunks concatenated)" if use_chunking else ""
+        print(f'Audio written to "{output_file}"{chunk_note}')
+        for f in output_files:
+            if f["source"] == "ffmpeg":
+                print(f'  + transcoded: "{f["file"]}" ({f["bytes"]} bytes, {f["format"]})')
 
 
 if __name__ == "__main__":

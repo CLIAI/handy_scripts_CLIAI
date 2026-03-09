@@ -6,19 +6,21 @@ Google Cloud Gemini TTS.
 ## Quick Start
 
 ```bash
-# Simple two-speaker dialogue
-uv run multi-speaker_markup_from_dialog_transcript.py \
-  -i dialogue.txt -o output.mp3
+# Default: produces .wav + .ogg + .mp3 (lossless from API, high-quality local transcode)
+uv run multi-speaker_markup_from_dialog_transcript.py -i dialogue.txt
 
-# With custom voices and style prompt
+# With custom voices and style prompt (still 3 files)
 uv run multi-speaker_markup_from_dialog_transcript.py \
-  -i dialogue.txt -o output.ogg -e ogg \
-  --voices Charon,Kore \
+  -i dialogue.txt --voices Charon,Kore \
   -p "Casual conversation between friends"
 
-# German dialogue with high-quality OGG output
+# Single format from API directly (no local transcoding)
 uv run multi-speaker_markup_from_dialog_transcript.py \
-  -i german_dialogue.txt -l de-DE -e ogg \
+  -i dialogue.txt -e ogg -o output.ogg
+
+# German dialogue
+uv run multi-speaker_markup_from_dialog_transcript.py \
+  -i german_dialogue.txt -l de-DE \
   --voices Orus,Aoede \
   -p "Patient teacher with enthusiastic student"
 ```
@@ -28,6 +30,7 @@ uv run multi-speaker_markup_from_dialog_transcript.py \
 * Google Cloud project with Text-to-Speech API enabled
 * Application Default Credentials: `gcloud auth application-default login`
 * Python >=3.11 (or just use `uv run` — dependencies auto-installed via PEP 723)
+* **ffmpeg** (for local transcoding to .ogg and .mp3 — optional but recommended)
 
 ## Input Format
 
@@ -45,20 +48,36 @@ Teacher: Sehr gut! That's perfect.
 
 ## Audio Quality Guide
 
-The API **does not expose bitrate or quality level controls**. Quality is
-determined entirely by the encoding format choice:
+### Default behavior (recommended)
+
+By default, the tool requests **lossless WAV** from the API and locally
+transcodes via ffmpeg to:
+
+* `.wav` — lossless (LINEAR16), largest files
+* `.ogg` — Opus VBR ~96kbps (excellent quality for speech)
+* `.mp3` — LAME VBR V2 ~190kbps (high quality, widely compatible)
+
+This gives you the best of all worlds: a lossless master plus high-quality
+compressed versions. The API's built-in MP3 is only 32kbps — local
+transcoding from WAV is vastly better.
+
+### Single-format mode (-e flag)
+
+Use `-e` to request a specific format from the API directly (no local
+transcoding, single output file):
 
 | Encoding | Flag | Quality | Notes |
 |----------|------|---------|-------|
-| OGG_OPUS | `-e ogg` | **Best lossy** | "Considerably higher than MP3 at similar bitrate" — recommended |
-| LINEAR16 | `-e wav` | **Lossless** | Uncompressed PCM, largest files. Best for post-processing |
-| MP3 | `-e mp3` | Low | **Fixed 32kbps** — no bitrate control. Smallest files |
-| MULAW | `-e mulaw` | Telephony | 8-bit G.711 mu-law. For telephony pipelines |
-| ALAW | `-e alaw` | Telephony | 8-bit G.711 A-law. Not supported by Chirp 3 HD voices |
+| OGG_OPUS | `-e ogg` | Best API lossy | "Considerably higher than MP3 at similar bitrate" |
+| LINEAR16 | `-e wav` | Lossless | Uncompressed PCM + WAV header |
+| MP3 | `-e mp3` | Low | **Fixed 32kbps** — no bitrate control |
+| MULAW | `-e mulaw` | Telephony | 8-bit G.711 mu-law |
+| ALAW | `-e alaw` | Telephony | 8-bit G.711 A-law. Not supported by Chirp 3 HD |
 
-**Recommendation:** Use **OGG** (`-e ogg`) for quality output, or **WAV**
-(`-e wav`) if you plan to post-process. MP3 is convenient but 32kbps is
-quite low for speech — fine for previews, not for production.
+### WAV only (no transcoding)
+
+Use `--no-transcode` to get just the lossless WAV from the API without
+ffmpeg compression.
 
 ### Sample Rate
 
