@@ -103,12 +103,49 @@ GA (21): en-US, en-GB, en-AU, en-IN, de-DE, fr-FR, fr-CA, es-ES, es-US,
 The model handles mixed-language content within a single dialogue (e.g.
 English teacher using German phrases inline).
 
-## Audio Encodings
-MP3 (default), WAV/LINEAR16, OGG/OGG_OPUS, MULAW, ALAW
+## Audio Encodings and Quality
+The API does NOT provide bitrate or quality-level controls. Quality is
+determined entirely by the encoding format choice (-e flag):
+
+| Encoding  | -e flag | Quality     | Details                                        |
+|-----------|---------|-------------|------------------------------------------------|
+| OGG_OPUS  | ogg     | Best lossy  | "Considerably higher than MP3 at same bitrate" |
+| LINEAR16  | wav     | Lossless    | Uncompressed 16-bit PCM + WAV header           |
+| MP3       | mp3     | Low (32kbps)| Fixed bitrate, no control. Default but NOT best|
+| MULAW     | mulaw   | Telephony   | 8-bit G.711 mu-law                             |
+| ALAW      | alaw    | Telephony   | 8-bit G.711 A-law. NOT supported by Chirp 3 HD |
+
+RECOMMENDATION: Use ogg (-e ogg) for quality, wav (-e wav) for post-processing.
+MP3 is default for compatibility but 32kbps is low for speech.
+
+The complete AudioConfig parameter set (this is ALL the API exposes):
+- audioEncoding — format (see table above)
+- speakingRate — 0.25-4.0 (WARNING: ignored by Chirp 3 HD / Gemini voices)
+- pitch — -20.0 to 20.0 semitones (WARNING: ignored by Chirp 3 HD / Gemini voices)
+- volumeGainDb — -96.0 to 16.0 dB
+- sampleRateHertz — default 24000; changing triggers resampling
+- effectsProfileId — device profiles (8 available, see --audio-profile)
+
+There are NO additional quality parameters (no bitrate, no codec options, no
+quality level). Verified against REST API reference (see Sources below).
+
+## Audio Device Profiles (--audio-profile)
+Post-processing optimized for target playback device (repeatable flag):
+- headphone-class-device — headphones, earbuds
+- handset-class-device — smartphones
+- small-bluetooth-speaker-class-device — portable BT speakers
+- medium-bluetooth-speaker-class-device — smart home speakers (Google Home)
+- large-home-entertainment-class-device — TVs, home entertainment
+- large-automotive-class-device — car speakers
+- telephony-class-application — IVR, phone systems
+- wearable-class-device — smartwatches
 
 ## Models
 - gemini-2.5-flash-tts (default) — fast, cost-efficient
 - gemini-2.5-pro-tts — higher quality, better for podcasts/audiobooks
+
+Note: Both use Chirp 3 HD voices which do NOT support SSML input,
+speaking rate, pitch parameters, or A-Law encoding.
 
 ## Input Size Limits
 - Standard Cloud TTS v1: 5000 bytes (text or SSML)
@@ -181,6 +218,37 @@ Markup tags can be used in the dialogue text itself: [sigh], [whispering],
 - 0: success (or dry run)
 - 1: error (file exists, invalid args, API error)
 - 2: argparse error (missing required args)
+
+## Official Documentation References
+Use these to verify limits, parameters, and capabilities if they change:
+
+- Multi-speaker dialogue guide (byte limits, voices, prompting):
+  https://cloud.google.com/text-to-speech/docs/create-dialogue-with-multispeakers
+- REST API v1 reference (AudioConfig, AudioEncoding, all parameters):
+  https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize
+- REST API v1beta1 reference:
+  https://cloud.google.com/text-to-speech/docs/reference/rest/v1beta1/text/synthesize
+- Audio device profiles:
+  https://cloud.google.com/text-to-speech/docs/audio-profiles
+- Supported voices listing:
+  https://cloud.google.com/text-to-speech/docs/voices
+- Gemini / Chirp 3 TTS voices:
+  https://cloud.google.com/text-to-speech/docs/tts-voices
+- SSML reference (not supported by Chirp 3 HD voices):
+  https://cloud.google.com/text-to-speech/docs/ssml
+- Quotas and limits:
+  https://cloud.google.com/text-to-speech/quotas
+- Python client library:
+  https://cloud.google.com/text-to-speech/docs/libraries
+
+Key facts to verify:
+- MP3 is "MP3 audio at 32kbps" (AudioEncoding enum in REST API ref)
+- OGG_OPUS: "considerably higher than MP3 while using approximately the same
+  bitrate" (AudioEncoding enum in REST API ref)
+- Gemini TTS combined limit: 8000 bytes text+prompt (multi-speaker guide)
+- Chirp 3 HD voices: no SSML, no rate/pitch, no A-Law (voices page)
+- AudioConfig has exactly 6 fields: audioEncoding, speakingRate, pitch,
+  volumeGainDb, sampleRateHertz, effectsProfileId (REST API ref)
 """.strip()
 
 
@@ -505,8 +573,10 @@ def get_audio_encoding(encoding_str):
 def main():
     global args
     parser = argparse.ArgumentParser(
-        description="Generate multi-speaker dialogue audio using Gemini TTS.",
-        epilog="Example: %(prog)s -i dialogue.txt --voices Charon,Kore -p 'Friendly conversation'",
+        description="Generate multi-speaker dialogue audio using Gemini TTS. "
+                    "For best quality use -e ogg (OGG_OPUS). Default mp3 is only 32kbps. "
+                    "Use --help-llm for full reference with official doc links.",
+        epilog="Example: %(prog)s -i dialogue.txt -e ogg --voices Charon,Kore -p 'Friendly conversation'",
     )
 
     # I/O
@@ -517,7 +587,11 @@ def main():
     parser.add_argument("-f", "--force", action="store_true",
                         help="Overwrite output file if it already exists")
     parser.add_argument("-e", "--encoding", default=None,
-                        help="Audio encoding: mp3 (default), wav, ogg, mulaw, alaw")
+                        help="Audio encoding: mp3 (default, 32kbps fixed — low quality), "
+                             "ogg (OGG_OPUS — best lossy quality, recommended), "
+                             "wav (LINEAR16 lossless, largest files), "
+                             "mulaw, alaw (telephony). "
+                             "Note: API provides NO bitrate control — quality depends on format choice.")
 
     # TTS config
     parser.add_argument("-l", "--language", default="en-US",
@@ -532,16 +606,23 @@ def main():
 
     # Audio tuning
     parser.add_argument("--rate", type=float, default=None,
-                        help="Speaking rate 0.25-4.0 (default: 1.0)")
+                        help="Speaking rate 0.25-4.0 (default: 1.0). "
+                             "WARNING: may be ignored by Chirp 3 HD / Gemini TTS voices.")
     parser.add_argument("--pitch", type=float, default=None,
-                        help="Pitch in semitones -20.0 to 20.0 (default: 0.0)")
+                        help="Pitch in semitones -20.0 to 20.0 (default: 0.0). "
+                             "WARNING: may be ignored by Chirp 3 HD / Gemini TTS voices.")
     parser.add_argument("--volume", type=float, default=None,
                         help="Volume gain in dB -96.0 to 16.0 (default: 0.0)")
     parser.add_argument("--sample-rate", type=int, default=None,
-                        help="Sample rate in Hz (default: 24000)")
+                        help="Sample rate in Hz (default: 24000). "
+                             "Changing from native rate triggers resampling (may reduce quality).")
     parser.add_argument("--audio-profile", action="append", default=None,
                         help="Audio device profile (repeatable): headphone-class-device, "
-                             "handset-class-device, telephony-class-application, etc.")
+                             "handset-class-device, small-bluetooth-speaker-class-device, "
+                             "medium-bluetooth-speaker-class-device, "
+                             "large-home-entertainment-class-device, "
+                             "large-automotive-class-device, "
+                             "telephony-class-application, wearable-class-device")
 
     # Modes
     parser.add_argument("--chunk", action="store_true",
